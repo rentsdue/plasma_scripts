@@ -103,11 +103,15 @@ if __name__ == "__main__":
         axs[1].plot(modes_axis, y_ky, color=colors[idx], alpha=0.7, lw=1.2)
         axs[2].plot(modes_axis, y_zf, color=colors[idx], alpha=0.7, lw=1.2, label=lbl)
         
-    titles = [r"1D Spectrum $\log_{10} E(k_x)$", r"1D Spectrum $\log_{10} E(k_y)$", r"Zonal Spectrum $\log_{10} E_{\text{zonal}}(k_x)$"]
+    titles = [
+        r"Radial Energy Spectrum: $\log_{10} E(k_x)$",
+        r"Poloidal Energy Spectrum: $\log_{10} E(k_y)$",
+        r"Zonal-Flow Energy Spectrum: $\log_{10} E_{ZF}(k_x)$"
+    ]
     for i, ax in enumerate(axs):
         ax.set_title(titles[i], fontsize=11)
-        ax.set_xlabel("Mode Index ($m$)")
-        ax.set_ylabel("Log Energy Intensity")
+        ax.set_xlabel(r"Mode number $m$")
+        ax.set_ylabel(r"Kinetic energy, $\log_{10} E$")
         ax.set_xlim(1, 64) # Crop display to informative range
         ax.grid(True, alpha=0.25, linestyle=':')
         

@@ -170,23 +170,23 @@ if __name__ == "__main__":
     
     # Panel 6a: Cropped True Power Spectrum Heatmap
     im0 = axs[0].pcolormesh(modes_axis, log10_c_axis, true_matrix_cropped, cmap='viridis', shading='auto', vmin=vmin, vmax=vmax)
-    axs[0].set_title(r"Fig 6a: True Log $\overline{P}_{ZF}(m; C)$ Spectrum", fontsize=12)
-    axs[0].set_xlabel("Mode Index $m$ (1 to 64)", fontsize=11)
-    axs[0].set_ylabel(r"$\log_{10} C$", fontsize=11)
-    fig.colorbar(im0, ax=axs[0], label=r"Log Power Intensity $\log_{10} P$")
+    axs[0].set_title(r"Simulation: $\log_{10} P_{ZF}(m; C)$", fontsize=12)
+    axs[0].set_xlabel(r"Radial mode number $m$", fontsize=11)
+    axs[0].set_ylabel(r"Adiabaticity $\log_{10}(C)$", fontsize=11)
+    fig.colorbar(im0, ax=axs[0], label=r"Zonal-flow power $\log_{10} P_{ZF}$")
     
     # Panel 6b: Cropped Prediction Power Spectrum Heatmap
     im1 = axs[1].pcolormesh(modes_axis, log10_c_axis, nn_matrix_cropped, cmap='viridis', shading='auto', vmin=vmin, vmax=vmax)
-    axs[1].set_title("Fig 6b: LOOCV Mode Prediction", fontsize=12)
-    axs[1].set_xlabel("Mode Index $m$ (1 to 64)", fontsize=11)
-    axs[1].set_ylabel(r"$\log_{10} C$", fontsize=11)
-    fig.colorbar(im1, ax=axs[1], label=r"Log Power Intensity $\log_{10} P$")
+    axs[1].set_title(r"ML prediction: $\log_{10} P_{ZF}(m; C)$", fontsize=12)
+    axs[1].set_xlabel(r"Radial mode number $m$", fontsize=11)
+    axs[1].set_ylabel(r"Adiabaticity $\log_{10}(C)$", fontsize=11)
+    fig.colorbar(im1, ax=axs[1], label=r"Zonal-flow power $\log_{10} P_{ZF}$")
     
     # Panel 6c: Performance Curve using Median Deviation (DEX)
-    axs[2].plot(log10_c_axis, nn_dex_errors, marker='o', color='#1f77b4', linewidth=2, markersize=6, label='POD-FFNN Model')
-    axs[2].set_title("Fig 6c: Per-C Wavenumber Error Spectrum", fontsize=12)
-    axs[2].set_xlabel(r"$\log_{10} C$", fontsize=11)
-    axs[2].set_ylabel("Median Absolute Error [Decades]", fontsize=11)
+    axs[2].plot(log10_c_axis, nn_dex_errors, marker='o', color='#1f77b4', linewidth=2, markersize=6, label='POD-FFNN prediction')
+    axs[2].set_title(r"Median Spectrum Error vs $C$", fontsize=12)
+    axs[2].set_xlabel(r"Adiabaticity $\log_{10}(C)$", fontsize=11)
+    axs[2].set_ylabel("Median absolute error [dex]", fontsize=11)
     axs[2].grid(True, which="both", alpha=0.35, linestyle=':')
     axs[2].legend(loc='upper right')
     

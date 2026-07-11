@@ -79,9 +79,9 @@ if __name__ == "__main__":
         lbl = f"C={dataset.raw_c_values[idx]:.3e}"
         plt.plot(modes_axis, dataset.log_profiles[idx], color=colors[idx], alpha=0.8, lw=1.5, label=lbl)
         
-    plt.title("Step 1 Log-Power Smoothness Check (Core Wavenumbers)")
-    plt.xlabel("Mode Index ($m$)")
-    plt.ylabel(r"Zonal Flow Log-Power $\log_{10}(\overline{P}_m)$")
+    plt.title(r"Zonal-Flow Power Spectra Vary Smoothly with $C$")
+    plt.xlabel(r"Radial mode number $m$")
+    plt.ylabel(r"Zonal-flow power, $\log_{10} P_{ZF}(m; C)$")
     plt.xlim(1, 64)  # Focus display strictly on informative modes
     plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left', ncol=2, fontsize=8)
     plt.grid(True, alpha=0.25, linestyle=':')
