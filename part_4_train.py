@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 import matplotlib.pyplot as plt
+from plasma_saturation import detect_saturation_window
 
 # -----------------------------------------------------------------------------
 # Step 5 / Part 4: Conditional VAE Snapshot Generation
@@ -69,32 +70,6 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     return np.array(series, dtype=np.float64)
 
 
-def detect_saturation_window(series, num_blocks=12, tolerance=0.10, reference_blocks=3):
-    """Detect the saturated window using block-mean convergence.
-
-    This follows the project rule:
-        E = scalar time series, K = 12 blocks, ref = mean of final 3 blocks,
-        onset = first block after which all block means stay within 10% of ref.
-
-    A tiny denominator floor is retained to avoid division-by-zero if ref ~ 0.
-    """
-    E = np.asarray(series, dtype=np.float64)
-    K = num_blocks
-    if len(E) < K:
-        t_start = len(E) // 2
-        return range(t_start, len(E)), t_start, E
-    means = np.array([b.mean() for b in np.array_split(E, K)])
-    ref = means[-reference_blocks:].mean()
-    denom = max(abs(ref), 1e-20)
-    onset = next(
-        (i for i in range(K) if np.all(np.abs(means[i:] - ref) / denom < tolerance)),
-        K // 2,
-    )
-    t_start = min(onset * (len(E) // K), len(E) - 1)
-    window = range(t_start, len(E))
-    return window, t_start, means
-
-
 def downsample_image_np(image, size):
     """Downsample [channels, nx, ny] numpy image to [channels, size, size]."""
     if size is None:
@@ -142,7 +117,9 @@ class SaturatedSnapshotDataset(Dataset):
 
                 T = uk.shape[0]
                 ke_series = compute_total_kinetic_energy_series(uk, kx2d, ky2d)
-                window, t_start, block_means = detect_saturation_window(ke_series)
+                window, sat_info = detect_saturation_window(ke_series)
+                t_start = sat_info["t_start"]
+                block_means = sat_info["block_means"]
                 all_indices = list(window)
                 if self.max_snapshots_per_c is not None and len(all_indices) > self.max_snapshots_per_c:
                     rng = np.random.default_rng(SEED)
