@@ -13,26 +13,29 @@ import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 # Step 4 Training: 2D Statistical Map Regression vs C
 # -----------------------------------------------------------------------------
-# Supports selectable targets:
-#   TARGET_TYPE = "rms"      -> log10 RMS potential fluctuation map
-#   TARGET_TYPE = "flux"     -> log10 local particle-flux magnitude map
-#   TARGET_TYPE = "spectrum" -> log10 2D potential spectral power map
-#   TARGET_TYPE = "all"      -> 3-channel target [rms, flux, spectrum]
+# TARGET_TYPE options:
+#   "rms"      : train RMS map only
+#   "flux"     : train local flux-magnitude map only
+#   "spectrum" : train 2D potential spectral-power map only
+#   "all"      : convenience mode; trains rms, flux, spectrum PER FAMILY
 #
-# Main model:
-#   log10(C) -> FFNN -> POD/PCA coefficients -> inverse PCA -> 2D map
+# Important: "all" is intentionally per-family. It does NOT stack
+# [rms | flux | spectrum] into one target vector and does NOT fit one shared PCA.
+# Instead, each family gets its own PCA/POD basis, FFNN coefficient model,
+# interpolation baseline, and score.
 #
-# Baseline:
-#   linear interpolation in log10(C) directly on flattened target maps
+# Spectrum scoring uses only informative low modes to avoid the high-|k| dead zone:
+#   fold +kx/-kx -> |kx|, then score the ~40x40 box |kx|=1..40 and ky=0..39.
 # -----------------------------------------------------------------------------
 
 DATA_DIR = "/zhisongqu_data/ameir/guillon_dns_triad/scan_IIIA_512"
-TARGET_TYPE = "all"  # Choose: "rms", "flux", "spectrum", or "all"
+TARGET_TYPE = "all"  # "rms", "flux", "spectrum", or "all"
 N_POD_MODES = 4
 EPOCHS = 1200
 LR = 0.01
 EPS = 1e-20
-SATURATION_START_FRACTION = 0.5
+LOW_KX_MODES = 40
+LOW_KY_MODES = 40
 
 
 def seed_everything(seed=42):
@@ -47,24 +50,56 @@ def seed_everything(seed=42):
 
 
 def infer_real_shape(uk_dataset):
-    """Infer real-space grid shape from rfft2-style storage."""
     nx = uk_dataset.shape[2]
     ny = 2 * (uk_dataset.shape[3] - 1)
     return nx, ny
 
 
-def extract_step4_maps(h5_file, start_fraction=SATURATION_START_FRACTION):
-    """Extract log-scaled Step 4 maps from one simulation file."""
+def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
+    series = []
+    for t in range(uk.shape[0]):
+        phi_k = uk[t, 0, :, :]
+        e_mode = 0.5 * (kx2d**2 + ky2d**2) * np.abs(phi_k)**2
+        series.append(np.sum(e_mode))
+    return np.array(series, dtype=np.float64)
+
+
+def detect_saturation_window(series, num_blocks=12, tolerance=0.10, reference_blocks=3):
+    """Detect the saturated window using block-mean convergence.
+
+    This follows the project rule:
+        E = scalar time series, K = 12 blocks, ref = mean of final 3 blocks,
+        onset = first block after which all block means stay within 10% of ref.
+
+    A tiny denominator floor is retained to avoid division-by-zero if ref ~ 0.
+    """
+    E = np.asarray(series, dtype=np.float64)
+    K = num_blocks
+    if len(E) < K:
+        t_start = len(E) // 2
+        return range(t_start, len(E)), t_start, E
+    means = np.array([b.mean() for b in np.array_split(E, K)])
+    ref = means[-reference_blocks:].mean()
+    denom = max(abs(ref), 1e-20)
+    onset = next(
+        (i for i in range(K) if np.all(np.abs(means[i:] - ref) / denom < tolerance)),
+        K // 2,
+    )
+    t_start = min(onset * (len(E) // K), len(E) - 1)
+    window = range(t_start, len(E))
+    return window, t_start, means
+
+
+def extract_step4_maps(h5_file):
     c_val = h5_file["params/C"][()]
     kappa = h5_file["params/kappa"][()] if "params/kappa" in h5_file else 1.0
-
     uk = h5_file["fields/uk"]
+    kx2d = h5_file["data/kx"][()]
     ky2d = h5_file["data/ky"][()]
     nx, ny = infer_real_shape(uk)
-
     T = uk.shape[0]
-    t0 = int(start_fraction * T)
-    window = range(t0, T)
+    ke_series = compute_total_kinetic_energy_series(uk, kx2d, ky2d)
+    window, t_start, block_means = detect_saturation_window(ke_series)
     n_t = len(window)
 
     phi_sq_accum = np.zeros((nx, ny), dtype=np.float64)
@@ -74,13 +109,10 @@ def extract_step4_maps(h5_file, start_fraction=SATURATION_START_FRACTION):
     for t in window:
         phi_k = uk[t, 0, :, :]
         n_k = h5_file["fields/nk"][t, 0, :, :] if "fields/nk" in h5_file else uk[t, 1, :, :]
-
         grady_phi_k = 1j * ky2d * phi_k
-
         phi = np.fft.irfft2(phi_k, s=(nx, ny), norm="forward")
         density = np.fft.irfft2(n_k, s=(nx, ny), norm="forward")
         grady_phi = np.fft.irfft2(grady_phi_k, s=(nx, ny), norm="forward")
-
         phi_sq_accum += phi**2
         flux_accum += -kappa * density * grady_phi
         spectrum_accum += np.abs(np.fft.fft2(phi, norm="forward")) ** 2
@@ -88,7 +120,6 @@ def extract_step4_maps(h5_file, start_fraction=SATURATION_START_FRACTION):
     rms_map = np.sqrt(phi_sq_accum / n_t)
     flux_map = flux_accum / n_t
     spectrum_map = spectrum_accum / n_t
-
     return {
         "C": c_val,
         "shape": (nx, ny),
@@ -100,74 +131,31 @@ def extract_step4_maps(h5_file, start_fraction=SATURATION_START_FRACTION):
 
 class Step4MapDataset(Dataset):
     def __init__(self, data_dir, target_type="spectrum"):
-        if target_type not in {"rms", "flux", "spectrum", "all"}:
-            raise ValueError("target_type must be 'rms', 'flux', 'spectrum', or 'all'")
-
+        if target_type not in {"rms", "flux", "spectrum"}:
+            raise ValueError("target_type must be 'rms', 'flux', or 'spectrum'. Use main loop for 'all'.")
         self.data_dir = data_dir
         self.target_type = target_type
-        self.file_list = sorted(
-            f for f in os.listdir(data_dir)
-            if f.endswith(".h5") and f.startswith("hwak_C")
-        )
-
-        self.raw_c_values = []
-        self.inputs = []
-        self.targets = []
-        self.target_maps = {
-            "rms": [],
-            "flux": [],
-            "spectrum": [],
-        }
+        self.file_list = sorted(f for f in os.listdir(data_dir) if f.endswith(".h5") and f.startswith("hwak_C"))
+        self.raw_c_values, self.inputs, self.targets = [], [], []
         self.grid_shape = None
-
         self._process_files()
-
-    def _select_target(self, maps):
-        if self.target_type == "all":
-            # Shape: [3, nx, ny]
-            return np.stack([maps["rms"], maps["flux"], maps["spectrum"]], axis=0)
-
-        # Shape: [1, nx, ny]
-        return maps[self.target_type][None, :, :]
 
     def _process_files(self):
         print(f"Extracting Step 4 target='{self.target_type}' maps...")
-
         for file_name in self.file_list:
-            file_path = os.path.join(self.data_dir, file_name)
-            with h5py.File(file_path, "r") as f:
+            with h5py.File(os.path.join(self.data_dir, file_name), "r") as f:
                 maps = extract_step4_maps(f)
-
             self.grid_shape = maps["shape"]
             c_val = maps["C"]
-            selected = self._select_target(maps)
-
             self.raw_c_values.append(c_val)
             self.inputs.append([np.log10(c_val)])
-            self.targets.append(selected.reshape(-1))
-
-            for key in self.target_maps:
-                self.target_maps[key].append(maps[key])
-
+            self.targets.append(maps[self.target_type].reshape(-1))
         self.raw_c_values = np.array(self.raw_c_values, dtype=np.float32)
         self.inputs = np.array(self.inputs, dtype=np.float32)
         self.targets = np.array(self.targets, dtype=np.float32)
 
-        for key in self.target_maps:
-            self.target_maps[key] = np.array(self.target_maps[key], dtype=np.float32)
-
-    @property
-    def n_channels(self):
-        return 3 if self.target_type == "all" else 1
-
-    def channel_names(self):
-        if self.target_type == "all":
-            return ["RMS amplitude", "Local flux", "Spectral power"]
-        return [self.target_type]
-
     def unflatten(self, flat):
-        nx, ny = self.grid_shape
-        return flat.reshape(self.n_channels, nx, ny)
+        return flat.reshape(self.grid_shape)
 
     def __len__(self):
         return len(self.inputs)
@@ -180,215 +168,156 @@ class PodCoefficientFFNN(nn.Module):
     def __init__(self, input_dim=1, num_modes=4):
         super().__init__()
         self.network = nn.Sequential(
-            nn.Linear(input_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 64),
-            nn.ReLU(),
+            nn.Linear(input_dim, 32), nn.ReLU(),
+            nn.Linear(32, 64), nn.ReLU(),
             nn.Linear(64, num_modes),
         )
-
     def forward(self, x):
         return self.network(x)
 
 
-def median_dex(pred, true):
-    """Median absolute error in log10 space, i.e. dex."""
-    return float(np.median(np.abs(pred - true)))
+def fold_kx_log_spectrum(log_map, n_kx=LOW_KX_MODES):
+    """Fold +kx and -kx in linear power, then return log10 folded spectrum."""
+    n_kx = min(n_kx, (log_map.shape[0] - 1) // 2)
+    linear = 10.0 ** log_map
+    folded = linear[1:n_kx + 1, :] + linear[-n_kx:, :][::-1, :]
+    return np.log10(folded + EPS)
+
+
+def informative_error(pred_flat, true_flat, dataset):
+    pred_map = dataset.unflatten(pred_flat)
+    true_map = dataset.unflatten(true_flat)
+    if dataset.target_type != "spectrum":
+        return float(np.median(np.abs(pred_map - true_map)))
+    pred_fold = fold_kx_log_spectrum(pred_map, LOW_KX_MODES)
+    true_fold = fold_kx_log_spectrum(true_map, LOW_KX_MODES)
+    n_ky = min(LOW_KY_MODES, pred_fold.shape[1])  # ky=0..39 by default
+    # Score only the informative low-mode box: folded |kx|=1..40 and ky=0..39.
+    return float(np.median(np.abs(pred_fold[:, :n_ky] - true_fold[:, :n_ky])))
 
 
 def plot_validation_panel(dataset, row, output_name):
-    """Plot true map, predicted map, and absolute dex error map."""
-    true_maps = dataset.unflatten(row["True_Target"])
-    pred_maps = dataset.unflatten(row["NN_Target"])
-    names = dataset.channel_names()
-
-    n_channels = true_maps.shape[0]
-    fig, axs = plt.subplots(n_channels, 3, figsize=(13.5, 4.2 * n_channels), squeeze=False)
-
-    for ch in range(n_channels):
-        true_img = true_maps[ch]
-        pred_img = pred_maps[ch]
-        error_img = np.abs(pred_img - true_img)
-
-        vmin, vmax = np.nanpercentile(true_img, [2, 98])
-
-        im0 = axs[ch, 0].imshow(true_img, cmap="inferno", origin="lower", vmin=vmin, vmax=vmax)
-        axs[ch, 0].set_title(f"True {names[ch]}")
-        plt.colorbar(im0, ax=axs[ch, 0], fraction=0.046)
-
-        im1 = axs[ch, 1].imshow(pred_img, cmap="inferno", origin="lower", vmin=vmin, vmax=vmax)
-        axs[ch, 1].set_title("POD-FFNN prediction")
-        plt.colorbar(im1, ax=axs[ch, 1], fraction=0.046)
-
-        im2 = axs[ch, 2].imshow(error_img, cmap="viridis", origin="lower")
-        axs[ch, 2].set_title("Absolute error [dex]")
-        plt.colorbar(im2, ax=axs[ch, 2], fraction=0.046)
-
-    plt.suptitle(f"Step 4 validation at out-of-sample C={row['C_Value']:.4g}", fontweight="bold")
+    true_map = dataset.unflatten(row["True_Target"])
+    pred_map = dataset.unflatten(row["NN_Target"])
+    if dataset.target_type == "spectrum":
+        true_map = fold_kx_log_spectrum(true_map, LOW_KX_MODES)[:, :LOW_KY_MODES]
+        pred_map = fold_kx_log_spectrum(pred_map, LOW_KX_MODES)[:, :LOW_KY_MODES]
+        title = r"Folded low-mode spectrum $P_\phi(|k_x|,k_y)$"
+        xlabel, ylabel = r"$k_y$ mode", r"$|k_x|$ mode"
+    else:
+        title = f"{dataset.target_type} spatial map"
+        xlabel, ylabel = "y index", "x index"
+    error_map = np.abs(pred_map - true_map)
+    vmin, vmax = np.nanpercentile(true_map, [2, 98])
+    fig, axs = plt.subplots(1, 3, figsize=(14, 4.5))
+    for ax, img, ttl, cmap in [
+        (axs[0], true_map, "Simulation", "inferno"),
+        (axs[1], pred_map, "ML prediction", "inferno"),
+        (axs[2], error_map, "Prediction error [dex]", "viridis"),
+    ]:
+        im = ax.imshow(img, origin="lower", cmap=cmap, vmin=vmin if cmap == "inferno" else None, vmax=vmax if cmap == "inferno" else None)
+        ax.set_title(ttl)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        plt.colorbar(im, ax=ax, fraction=0.046)
+    plt.suptitle(f"{title} for held-out C={row['C_Value']:.4g}", fontweight="bold")
     plt.tight_layout()
     plt.savefig(output_name, dpi=200)
     print(f"[Success] Saved '{output_name}'.")
 
 
 def plot_spectrum_mode_sweep(dataset, df, output_name):
-    """
-    Plot Part-2-style m-mode sweep for spectral targets only.
-
-    This is appropriate for the spectral map because it already lives in Fourier/mode space.
-    For RMS and flux real-space maps, this plot is skipped unless TARGET_TYPE='all', where
-    the spectral channel is available as channel 2.
-    """
-    if dataset.target_type not in {"spectrum", "all"}:
-        print("[Info] Skipping m-mode sweep because target is not spectral.")
+    if dataset.target_type != "spectrum":
         return
-
-    spectrum_channel = 0 if dataset.target_type == "spectrum" else 2
-    mode_max = min(65, dataset.grid_shape[1])
-    modes = np.arange(1, mode_max)
+    modes = np.arange(0, LOW_KY_MODES)
     c_values = df["C_Value"].values
-
-    true_profiles = []
-    pred_profiles = []
-
+    true_profiles, pred_profiles = [], []
     for _, row in df.iterrows():
-        true_map = dataset.unflatten(row["True_Target"])[spectrum_channel]
-        pred_map = dataset.unflatten(row["NN_Target"])[spectrum_channel]
-
-        # Collapse 2D spectrum into 1D ky/m_y profile by averaging over kx.
-        true_profiles.append(np.mean(true_map, axis=0)[1:mode_max])
-        pred_profiles.append(np.mean(pred_map, axis=0)[1:mode_max])
-
-    true_profiles = np.array(true_profiles)
-    pred_profiles = np.array(pred_profiles)
-
+        true_fold = fold_kx_log_spectrum(dataset.unflatten(row["True_Target"]), LOW_KX_MODES)
+        pred_fold = fold_kx_log_spectrum(dataset.unflatten(row["NN_Target"]), LOW_KX_MODES)
+        true_profiles.append(np.mean(true_fold[:, :LOW_KY_MODES], axis=0))
+        pred_profiles.append(np.mean(pred_fold[:, :LOW_KY_MODES], axis=0))
+    true_profiles, pred_profiles = np.array(true_profiles), np.array(pred_profiles)
     vmin, vmax = np.nanpercentile(true_profiles, [2, 98])
-
     fig, axs = plt.subplots(1, 3, figsize=(18, 5.2))
-
     im0 = axs[0].pcolormesh(modes, c_values, true_profiles, cmap="inferno", shading="auto", vmin=vmin, vmax=vmax)
-    axs[0].set_yscale("log")
-    axs[0].set_title(r"True mode sweep: $\log_{10} P_\phi(m_y)$")
-    axs[0].set_xlabel("Mode number m")
-    axs[0].set_ylabel("C")
-    plt.colorbar(im0, ax=axs[0])
-
+    axs[0].set_yscale("log"); axs[0].set_title(r"Simulation: $\log_{10}P_\phi(k_y;C)$")
+    axs[0].set_xlabel(r"Poloidal mode $k_y$"); axs[0].set_ylabel(r"Adiabaticity $C$")
+    plt.colorbar(im0, ax=axs[0], label=r"Spectral power")
     im1 = axs[1].pcolormesh(modes, c_values, pred_profiles, cmap="inferno", shading="auto", vmin=vmin, vmax=vmax)
-    axs[1].set_yscale("log")
-    axs[1].set_title("Predicted mode sweep")
-    axs[1].set_xlabel("Mode number m")
-    axs[1].set_ylabel("C")
-    plt.colorbar(im1, ax=axs[1])
-
+    axs[1].set_yscale("log"); axs[1].set_title(r"ML prediction: $\log_{10}P_\phi(k_y;C)$")
+    axs[1].set_xlabel(r"Poloidal mode $k_y$"); axs[1].set_ylabel(r"Adiabaticity $C$")
+    plt.colorbar(im1, ax=axs[1], label=r"Spectral power")
     profile_err = np.median(np.abs(pred_profiles - true_profiles), axis=1)
-    axs[2].plot(c_values, profile_err, marker="o", color="#1f77b4")
-    axs[2].set_xscale("log")
-    axs[2].set_title("Median mode-profile error")
-    axs[2].set_xlabel("C")
-    axs[2].set_ylabel("Median absolute error [dex]")
+    axs[2].plot(c_values, profile_err, marker="o")
+    axs[2].set_xscale("log"); axs[2].set_title("Low-mode profile error")
+    axs[2].set_xlabel(r"Adiabaticity $C$"); axs[2].set_ylabel("Median error [dex]")
     axs[2].grid(True, alpha=0.3, linestyle=":")
-
-    plt.tight_layout()
-    plt.savefig(output_name, dpi=200)
+    plt.tight_layout(); plt.savefig(output_name, dpi=200)
     print(f"[Success] Saved '{output_name}'.")
 
 
 def run_loocv(dataset, device):
     results = []
-    num_points = len(dataset)
-
-    print(f"\nRunning Step 4 LOOCV for target='{dataset.target_type}' over {num_points} C values...")
-
-    for test_idx in range(num_points):
+    for test_idx in range(len(dataset)):
         test_c = dataset.raw_c_values[test_idx]
-        train_indices = [i for i in range(num_points) if i != test_idx]
-
-        train_y = dataset.targets[train_indices]
-        true_y = dataset.targets[test_idx]
-
-        # PCA modes cannot exceed number of training samples or output dimension.
+        train_indices = [i for i in range(len(dataset)) if i != test_idx]
+        train_y, true_y = dataset.targets[train_indices], dataset.targets[test_idx]
         n_modes = min(N_POD_MODES, len(train_indices), train_y.shape[1])
-
         pca = PCA(n_components=n_modes)
         train_coeffs = pca.fit_transform(train_y)
-
-        coeff_mean = train_coeffs.mean(axis=0)
-        coeff_std = train_coeffs.std(axis=0) + 1e-8
+        coeff_mean, coeff_std = train_coeffs.mean(axis=0), train_coeffs.std(axis=0) + 1e-8
         train_coeffs_scaled = (train_coeffs - coeff_mean) / coeff_std
-
         train_x = torch.tensor(dataset.inputs[train_indices], dtype=torch.float32, device=device)
         train_target = torch.tensor(train_coeffs_scaled, dtype=torch.float32, device=device)
         test_x = torch.tensor(dataset.inputs[test_idx], dtype=torch.float32, device=device).unsqueeze(0)
-
-        # Linear interpolation baseline directly in flattened log-map space.
-        baseline = interp1d(
-            dataset.inputs[train_indices].squeeze(),
-            train_y,
-            axis=0,
-            kind="linear",
-            fill_value="extrapolate",
-        )
+        baseline = interp1d(dataset.inputs[train_indices].squeeze(), train_y, axis=0, kind="linear", fill_value="extrapolate")
         base_pred_y = baseline(dataset.inputs[test_idx].squeeze())
-
         model = PodCoefficientFFNN(num_modes=n_modes).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=LR)
         criterion = nn.MSELoss()
-
         model.train()
         for _ in range(EPOCHS):
             pred = model(train_x)
             loss = criterion(pred, train_target)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
         model.eval()
         with torch.no_grad():
             scaled_pred_coeffs = model(test_x).cpu().numpy().squeeze()
-
         pred_coeffs = scaled_pred_coeffs * coeff_std + coeff_mean
         nn_pred_y = pca.inverse_transform(pred_coeffs.reshape(1, -1)).squeeze()
-
-        nn_error = median_dex(nn_pred_y, true_y)
-        base_error = median_dex(base_pred_y, true_y)
-
-        results.append({
-            "C_Value": test_c,
-            "NN_DEX": nn_error,
-            "Base_DEX": base_error,
-            "True_Target": true_y,
-            "NN_Target": nn_pred_y,
-            "Base_Target": base_pred_y,
-        })
-
-        print(f" -> C={test_c:.3e} | NN={nn_error:.4f} dex | baseline={base_error:.4f} dex")
-
+        nn_error = informative_error(nn_pred_y, true_y, dataset)
+        base_error = informative_error(base_pred_y, true_y, dataset)
+        results.append({"C_Value": test_c, "NN_DEX": nn_error, "Base_DEX": base_error,
+                        "True_Target": true_y, "NN_Target": nn_pred_y, "Base_Target": base_pred_y})
+        print(f" -> {dataset.target_type} C={test_c:.3e} | NN={nn_error:.4f} dex | baseline={base_error:.4f} dex")
     return pd.DataFrame(results).sort_values("C_Value")
 
 
-def print_report(df, target_type):
+def train_one_family(target_type, device):
+    dataset = Step4MapDataset(DATA_DIR, target_type=target_type)
+    if target_type == "spectrum":
+        print(
+            f"[Info] Spectrum score uses folded low-mode box: "
+            f"|kx|=1..{LOW_KX_MODES}, ky=0..{LOW_KY_MODES - 1}."
+        )
+    df = run_loocv(dataset, device)
     print("\n" + "=" * 82)
-    print(f"STEP 4 2D MAP REGRESSION REPORT — TARGET: {target_type}".center(82))
+    print(f"STEP 4 REPORT — TARGET: {target_type}".center(82))
     print("=" * 82)
-    print(f"{'C':<12} | {'NN median dex':<16} | {'Baseline median dex':<20}")
-    print("-" * 82)
     for _, row in df.iterrows():
-        print(f"{row['C_Value']:<12.4g} | {row['NN_DEX']:<16.4f} | {row['Base_DEX']:<20.4f}")
-    print("=" * 82)
+        print(f"C={row['C_Value']:<10.4g} | NN={row['NN_DEX']:<8.4f} dex | baseline={row['Base_DEX']:<8.4f} dex")
+    sample_row = df.iloc[len(df) // 2]
+    plot_validation_panel(dataset, sample_row, f"step3_{target_type}_2d_map_validation.png")
+    if target_type == "spectrum":
+        plot_spectrum_mode_sweep(dataset, df, "step3_spectrum_mode_space_sweep.png")
+    return df
 
 
 if __name__ == "__main__":
     seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    dataset = Step4MapDataset(DATA_DIR, target_type=TARGET_TYPE)
-    df = run_loocv(dataset, device)
-    print_report(df, TARGET_TYPE)
-
-    # Representative 2D validation panel.
-    sample_row = df.iloc[len(df) // 2]
-    validation_output = f"step3_{TARGET_TYPE}_2d_map_validation.png"
-    plot_validation_panel(dataset, sample_row, validation_output)
-
-    # Part-2-style mode-space sweep only when a spectral channel is present.
-    sweep_output = f"step3_{TARGET_TYPE}_mode_space_sweep.png"
-    plot_spectrum_mode_sweep(dataset, df, sweep_output)
+    target_list = ["rms", "flux", "spectrum"] if TARGET_TYPE == "all" else [TARGET_TYPE]
+    all_results = {}
+    for target in target_list:
+        all_results[target] = train_one_family(target, device)

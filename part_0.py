@@ -8,6 +8,41 @@ from scipy.interpolate import interp1d
 import pandas as pd
 import matplotlib.pyplot as plt
 
+
+def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
+    series = []
+    for t in range(uk.shape[0]):
+        phi_k = uk[t, 0, :, :]
+        e_mode = 0.5 * (kx2d**2 + ky2d**2) * np.abs(phi_k)**2
+        series.append(np.sum(e_mode))
+    return np.array(series, dtype=np.float64)
+
+
+def detect_saturation_window(series, num_blocks=12, tolerance=0.10, reference_blocks=3):
+    """Detect the saturated window using block-mean convergence.
+
+    This follows the project rule:
+        E = scalar time series, K = 12 blocks, ref = mean of final 3 blocks,
+        onset = first block after which all block means stay within 10% of ref.
+
+    A tiny denominator floor is retained to avoid division-by-zero if ref ~ 0.
+    """
+    E = np.asarray(series, dtype=np.float64)
+    K = num_blocks
+    if len(E) < K:
+        t_start = len(E) // 2
+        return range(t_start, len(E)), t_start, E
+    means = np.array([b.mean() for b in np.array_split(E, K)])
+    ref = means[-reference_blocks:].mean()
+    denom = max(abs(ref), 1e-20)
+    onset = next(
+        (i for i in range(K) if np.all(np.abs(means[i:] - ref) / denom < tolerance)),
+        K // 2,
+    )
+    t_start = min(onset * (len(E) // K), len(E) - 1)
+    window = range(t_start, len(E))
+    return window, t_start, means
+
 # -----------------------------------------------------------------------------
 # 1. Dataset with Full Error Bar & Convergence Tracking
 # -----------------------------------------------------------------------------
@@ -39,7 +74,8 @@ class MultiScalarZFDatasetWithErrorBars(Dataset):
                 ky2d = f['data/ky'][()]
                 
                 T = uk.shape[0]
-                window = range(T // 2, T) 
+                ke_series = compute_total_kinetic_energy_series(uk, kx2d, ky2d)
+                window, t_start, block_means = detect_saturation_window(ke_series)
                 N_window = len(window)
                 
                 rms_t, gamma_t, energy_t = [], [], []
@@ -209,7 +245,7 @@ if __name__ == "__main__":
     
     # 5. Save C-Curves with Error Bars
     plt.figure(figsize=(10, 5))
-    plt.errorbar(df['C_Value'], df['True_RMS'], yerr=df['RMS_Std'], fmt='o', color='black', label='Simulation mean $\pm$ time variation', capsize=4)
+    plt.errorbar(df['C_Value'], df['True_RMS'], yerr=df['RMS_Std'], fmt='o', color='black', label=r'Simulation mean $\pm$ time variation', capsize=4)
     plt.plot(df['C_Value'], df['NN_Pred_RMS'], 'r-x', label='Neural-network prediction')
     plt.plot(df['C_Value'], df['Base_Pred_RMS'], 'b--.', label='Linear interpolation baseline')
     plt.xscale('log')
