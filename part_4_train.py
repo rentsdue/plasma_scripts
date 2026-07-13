@@ -36,7 +36,8 @@ EPOCHS = 80
 LR = 1e-3
 LATENT_DIM = 64
 BETA_KL = 1e-4
-HELDOUT_C_VALUES = [0.1, 0.5, 3.0]
+PREFERRED_HELDOUT_C_VALUES = [0.1, 0.5, 3.0]
+N_HELDOUT_C_VALUES = 3
 
 MODEL_OUT = "part4_cvae_model.pt"
 LOSS_FIG = "part4_cvae_loss_curve.png"
@@ -371,9 +372,49 @@ def plot_generated_samples(model, dataset, device, c_values=None, samples_per_c=
 
 
 # Purpose:
+#   Resolve preferred held-out C targets to values that actually exist.
+# How it works:
+#   Finds the nearest available simulation C for each preferred target, removes
+#   duplicates, and fills any missing slots with spread-out available C values.
+#   This keeps the low/mid/high validation idea without assuming exact C values
+#   are present in the current scan.
+def resolve_heldout_c_values(available_c_values, preferred_c_values, n_heldout=3):
+    available = np.sort(np.asarray(available_c_values, dtype=np.float32))
+    preferred = np.asarray(preferred_c_values, dtype=np.float32)
+    if available.size < 2:
+        raise ValueError("Need at least two distinct C values to create a train/validation C split.")
+
+    n_heldout = int(min(max(n_heldout, 1), available.size - 1))
+    selected = []
+
+    for target in preferred:
+        nearest = available[np.argmin(np.abs(np.log10(available) - np.log10(target)))]
+        if not any(np.isclose(nearest, c, rtol=0.0, atol=1e-6) for c in selected):
+            selected.append(float(nearest))
+        if len(selected) == n_heldout:
+            break
+
+    if len(selected) < n_heldout:
+        fill_positions = np.linspace(0, available.size - 1, n_heldout, dtype=int)
+        for idx in fill_positions:
+            candidate = float(available[idx])
+            if not any(np.isclose(candidate, c, rtol=0.0, atol=1e-6) for c in selected):
+                selected.append(candidate)
+            if len(selected) == n_heldout:
+                break
+
+    selected = np.array(sorted(selected), dtype=np.float32)
+    print("\nHeld-out C target resolution:")
+    print(f"  Preferred held-out C values: {np.array2string(preferred, precision=4)}")
+    print(f"  Available C values         : {np.array2string(available, precision=4)}")
+    print(f"  Resolved held-out C values : {np.array2string(selected, precision=4)}")
+    return selected
+
+
+# Purpose:
 #   Create a grouped held-out-C split for Step 4 validation.
 # How it works:
-#   All snapshots whose raw C value is in HELDOUT_C_VALUES are assigned to
+#   All snapshots whose raw C value is in the resolved held-out C values are assigned to
 #   validation; every other C value is used for training. This tests whether the
 #   conditional VAE generalizes to unseen physical parameters.
 def make_heldout_c_split(dataset, heldout_c_values, atol=1e-6):
@@ -417,7 +458,12 @@ def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = SaturatedSnapshotDataset(DATA_DIR)
     image_size = dataset.image_shape[0]
-    train_indices, val_indices = make_heldout_c_split(dataset, HELDOUT_C_VALUES)
+    resolved_heldout_c_values = resolve_heldout_c_values(
+        dataset.unique_c_values(),
+        PREFERRED_HELDOUT_C_VALUES,
+        n_heldout=N_HELDOUT_C_VALUES,
+    )
+    train_indices, val_indices = make_heldout_c_split(dataset, resolved_heldout_c_values)
     dataset.recompute_normalization_from_indices(train_indices)
     print_split_summary(dataset, train_indices, val_indices)
     train_ds = Subset(dataset, train_indices)
@@ -457,13 +503,14 @@ def train():
         "latent_dim": LATENT_DIM,
         "image_shape": dataset.image_shape,
         "downsample_to": DOWNSAMPLE_TO,
-        "heldout_c_values": HELDOUT_C_VALUES,
+        "preferred_heldout_c_values": PREFERRED_HELDOUT_C_VALUES,
+        "resolved_heldout_c_values": resolved_heldout_c_values.tolist(),
     }, MODEL_OUT)
     print(f"[Success] Saved '{MODEL_OUT}'.")
 
     plot_loss_curve(history)
     plot_reconstructions(model, dataset, device, indices=val_indices)
-    plot_generated_samples(model, dataset, device, c_values=HELDOUT_C_VALUES)
+    plot_generated_samples(model, dataset, device, c_values=resolved_heldout_c_values)
 
 
 if __name__ == "__main__":
