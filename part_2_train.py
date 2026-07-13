@@ -15,6 +15,10 @@ torch.manual_seed(0)
 np.random.seed(0)
 
 
+# Purpose:
+#   Build a smooth scalar time series used to identify saturated turbulence.
+# How it works:
+#   Sums 1/2 k^2 |phi_k|^2 over Fourier modes for each saved frame.
 def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     series = []
     for t in range(uk.shape[0]):
@@ -27,6 +31,10 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
 # -----------------------------------------------------------------------------
 # 1. Dataset Extraction: Multi-Scale Folded Array Building
 # -----------------------------------------------------------------------------
+# Purpose:
+#   Build Step 2 training targets from saturated folded spectra.
+# How it works:
+#   Averages spectral energy, folds symmetric kx modes, and concatenates log spectra.
 class SaturatedFoldedSpectraDataset(Dataset):
     def __init__(self, data_dir):
         self.data_dir = data_dir
@@ -90,6 +98,10 @@ class SaturatedFoldedSpectraDataset(Dataset):
     def __len__(self): return len(self.inputs)
     def __getitem__(self, idx): return torch.tensor(self.inputs[idx]), torch.tensor(self.log_profiles[idx])
 
+# Purpose:
+#   Step 2 POD-FFNN model for spectra.
+# How it works:
+#   Predicts PCA/POD coefficients for combined spectra from log10(C).
 class PodSpectraFFNN(nn.Module):
     def __init__(self, input_dim=1, num_modes=4):
         super(PodSpectraFFNN, self).__init__()
@@ -103,6 +115,10 @@ class PodSpectraFFNN(nn.Module):
     def forward(self, x): return self.network(x)
 
 
+# Purpose:
+#   Save detailed Step 2 per-spectrum-family error diagnostics.
+# How it works:
+#   Places E(kx), E(ky), and zonal ML-vs-interpolation errors in separate panels.
 def plot_family_error_breakdown(df, output_path="step2_spectra_family_error_breakdown.png"):
     """Save a supplementary per-family ML-vs-interpolation error diagnostic."""
     log10_c_axis = np.log10(df['C_Value'].values)

@@ -6,6 +6,10 @@ import matplotlib.pyplot as plt
 from plasma_saturation import detect_saturation_window
 
 
+# Purpose:
+#   Build a smooth scalar time series used to identify saturated turbulence.
+# How it works:
+#   Sums 1/2 k^2 |phi_k|^2 over Fourier modes for each saved frame.
 def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     series = []
     for t in range(uk.shape[0]):
@@ -15,6 +19,10 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     return np.array(series, dtype=np.float64)
 
 
+# Purpose:
+#   Build Step 1 EDA targets for zonal-flow Fourier power profiles.
+# How it works:
+#   Extracts saturated log-power profiles for smoothness and PCA/POD checks.
 class FourierPowerEDADataset:
     def __init__(self, data_dir):
         self.data_dir = data_dir

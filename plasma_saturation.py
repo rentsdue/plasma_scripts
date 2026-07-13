@@ -1,6 +1,10 @@
 import numpy as np
 
 
+# Purpose:
+#   Build a smooth scalar time series used to identify saturated turbulence.
+# How it works:
+#   Sums 1/2 k^2 |phi_k|^2 over Fourier modes for each saved frame.
 def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     """Compute a smooth total kinetic-energy scalar per saved timestep.
 
@@ -16,6 +20,10 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     return np.array(series, dtype=np.float64)
 
 
+# Purpose:
+#   Choose the saturated averaging window used by downstream ML targets.
+# How it works:
+#   Splits a smooth scalar into blocks and finds the stable tail near the final reference level.
 def detect_saturation_window(
     series,
     num_blocks=12,

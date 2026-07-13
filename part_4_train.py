@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 import matplotlib.pyplot as plt
 from plasma_saturation import detect_saturation_window
 
@@ -36,7 +36,7 @@ EPOCHS = 80
 LR = 1e-3
 LATENT_DIM = 64
 BETA_KL = 1e-4
-TRAIN_FRACTION = 0.9
+HELDOUT_C_VALUES = [0.1, 0.5, 3.0]
 
 MODEL_OUT = "part4_cvae_model.pt"
 LOSS_FIG = "part4_cvae_loss_curve.png"
@@ -44,6 +44,11 @@ RECON_FIG = "part4_reconstruction_examples.png"
 GEN_FIG = "part4_generated_snapshots.png"
 
 
+# Purpose:
+#   Make the Step 4 generative experiment reproducible.
+# How it works:
+#   Seeds Python, NumPy, and PyTorch random number generators, and asks cuDNN to
+#   use deterministic kernels where possible.
 def seed_everything(seed=SEED):
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -55,12 +60,23 @@ def seed_everything(seed=SEED):
     torch.backends.cudnn.benchmark = False
 
 
+# Purpose:
+#   Infer the real-space grid size from TOKAM2D's real-FFT Fourier layout.
+# How it works:
+#   The x dimension is stored directly, while the y dimension is reconstructed
+#   from the Hermitian half-spectrum length used by irfft2.
 def infer_real_shape(uk_dataset):
     nx = uk_dataset.shape[2]
     ny = 2 * (uk_dataset.shape[3] - 1)
     return nx, ny
 
 
+# Purpose:
+#   Compute a smooth saturation diagnostic for every saved snapshot.
+# How it works:
+#   Uses total kinetic energy K(t)=1/2 sum_k k^2 |phi_k|^2 from the Fourier
+#   potential field. This is smoother than flux and is used to choose the
+#   saturated training window.
 def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     series = []
     for t in range(uk.shape[0]):
@@ -70,6 +86,11 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     return np.array(series, dtype=np.float64)
 
 
+# Purpose:
+#   Reduce snapshot resolution before VAE training.
+# How it works:
+#   Converts a [channels, nx, ny] NumPy image to a temporary PyTorch tensor and
+#   applies bilinear interpolation to produce a smaller square image.
 def downsample_image_np(image, size):
     """Downsample [channels, nx, ny] numpy image to [channels, size, size]."""
     if size is None:
@@ -80,6 +101,14 @@ def downsample_image_np(image, size):
     return x.squeeze(0).numpy().astype(np.float32)
 
 
+# Purpose:
+#   Build the Step 4 dataset of saturated real-space plasma snapshots.
+# How it works:
+#   For each C-run, it detects the saturated window, transforms density and
+#   potential from Fourier space to real space, optionally downsamples, and
+#   stores [density, potential] images conditioned on log10(C).
+# Architecture role:
+#   Provides samples from p([n, phi] | C) for the conditional VAE.
 class SaturatedSnapshotDataset(Dataset):
     """Dataset of saturated real-space snapshots [density, potential] conditioned on log10(C)."""
 
@@ -100,7 +129,6 @@ class SaturatedSnapshotDataset(Dataset):
         self.channel_std = None
 
         self._process_files()
-        self._compute_normalization()
 
     def _process_files(self):
         print("Extracting saturated [n, phi] snapshots for conditional VAE...")
@@ -145,11 +173,13 @@ class SaturatedSnapshotDataset(Dataset):
         self.image_shape = self.images.shape[-2:]
         print(f"Loaded {len(self.images)} snapshots with image shape {self.images.shape[1:]}")
 
-    def _compute_normalization(self):
-        self.channel_mean = self.images.mean(axis=(0, 2, 3), keepdims=True).astype(np.float32)
-        self.channel_std = (self.images.std(axis=(0, 2, 3), keepdims=True) + 1e-8).astype(np.float32)
+    def recompute_normalization_from_indices(self, indices):
+        """Normalize all images using training indices only to avoid validation leakage."""
+        train_images = self.images[np.array(indices, dtype=int)]
+        self.channel_mean = train_images.mean(axis=(0, 2, 3), keepdims=True).astype(np.float32)
+        self.channel_std = (train_images.std(axis=(0, 2, 3), keepdims=True) + 1e-8).astype(np.float32)
         self.images = (self.images - self.channel_mean) / self.channel_std
-        print("Channel normalization:")
+        print("Channel normalization fitted on training C values only:")
         print(f"  density mean/std = {self.channel_mean.ravel()[0]:.4e} / {self.channel_std.ravel()[0]:.4e}")
         print(f"  phi     mean/std = {self.channel_mean.ravel()[1]:.4e} / {self.channel_std.ravel()[1]:.4e}")
 
@@ -171,6 +201,13 @@ class SaturatedSnapshotDataset(Dataset):
         return torch.tensor(self.images[idx]), torch.tensor(self.conditions[idx])
 
 
+# Purpose:
+#   Conditional variational autoencoder for saturated plasma snapshots.
+# How it works:
+#   The encoder receives [density, potential, log10(C)-channel] and maps each
+#   image to a Gaussian latent distribution. The decoder receives a random
+#   latent vector z plus log10(C), then generates a plausible [density, phi]
+#   snapshot for that condition.
 class ConditionalVAE(nn.Module):
     def __init__(self, image_size=128, latent_dim=LATENT_DIM):
         super().__init__()
@@ -226,12 +263,21 @@ class ConditionalVAE(nn.Module):
         return recon, mu, logvar
 
 
+# Purpose:
+#   Combine reconstruction quality with latent-space regularization.
+# How it works:
+#   Uses MSE for image reconstruction plus a beta-weighted KL divergence that
+#   keeps the latent distribution close to a standard normal prior.
 def vae_loss(recon, x, mu, logvar, beta=BETA_KL):
     recon_loss = F.mse_loss(recon, x, reduction="mean")
     kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
     return recon_loss + beta * kl_loss, recon_loss, kl_loss
 
 
+# Purpose:
+#   Visualize VAE training progress.
+# How it works:
+#   Plots total, reconstruction, and KL losses across epochs on a log scale.
 def plot_loss_curve(history):
     plt.figure(figsize=(8, 5))
     plt.plot(history["loss"], label="total loss")
@@ -248,10 +294,20 @@ def plot_loss_curve(history):
     print(f"[Success] Saved '{LOSS_FIG}'.")
 
 
-def plot_reconstructions(model, dataset, device, n_examples=3):
+# Purpose:
+#   Show reconstruction examples from the validation/held-out set.
+# How it works:
+#   Passes selected true snapshots through the encoder-decoder and plots true
+#   vs reconstructed density/potential fields.
+def plot_reconstructions(model, dataset, device, indices=None, n_examples=3):
     model.eval()
-    n_examples = min(n_examples, len(dataset))
-    indices = np.linspace(0, len(dataset) - 1, n_examples, dtype=int)
+    if indices is None:
+        n_examples = min(n_examples, len(dataset))
+        indices = np.linspace(0, len(dataset) - 1, n_examples, dtype=int)
+    else:
+        indices = np.array(indices, dtype=int)
+        n_examples = min(n_examples, len(indices))
+        indices = indices[np.linspace(0, len(indices) - 1, n_examples, dtype=int)]
     fig, axs = plt.subplots(n_examples, 4, figsize=(12, 3.2 * n_examples))
     if n_examples == 1:
         axs = axs[None, :]
@@ -278,9 +334,16 @@ def plot_reconstructions(model, dataset, device, n_examples=3):
     print(f"[Success] Saved '{RECON_FIG}'.")
 
 
-def plot_generated_samples(model, dataset, device, samples_per_c=2):
+# Purpose:
+#   Generate new plasma snapshots at selected C values.
+# How it works:
+#   Draws random latent vectors z and decodes them together with log10(C), so
+#   multiple statistically plausible samples can be generated for the same C.
+def plot_generated_samples(model, dataset, device, c_values=None, samples_per_c=2):
     model.eval()
-    c_values = dataset.unique_c_values()
+    if c_values is None:
+        c_values = dataset.unique_c_values()
+    c_values = np.array(c_values, dtype=np.float32)
     if len(c_values) > 3:
         c_values = np.array([c_values[0], c_values[len(c_values)//2], c_values[-1]])
 
@@ -307,15 +370,58 @@ def plot_generated_samples(model, dataset, device, samples_per_c=2):
     print(f"[Success] Saved '{GEN_FIG}'.")
 
 
+# Purpose:
+#   Create a grouped held-out-C split for Step 4 validation.
+# How it works:
+#   All snapshots whose raw C value is in HELDOUT_C_VALUES are assigned to
+#   validation; every other C value is used for training. This tests whether the
+#   conditional VAE generalizes to unseen physical parameters.
+def make_heldout_c_split(dataset, heldout_c_values, atol=1e-6):
+    heldout_c_values = np.array(heldout_c_values, dtype=np.float32)
+    is_heldout = np.zeros(len(dataset), dtype=bool)
+    for c_val in heldout_c_values:
+        is_heldout |= np.isclose(dataset.raw_c_values, c_val, rtol=0.0, atol=atol)
+
+    train_indices = np.where(~is_heldout)[0].tolist()
+    val_indices = np.where(is_heldout)[0].tolist()
+    if not train_indices or not val_indices:
+        raise ValueError(
+            "Held-out C split failed. Check that HELDOUT_C_VALUES exist in the dataset "
+            "and that at least one C remains for training."
+        )
+    return train_indices, val_indices
+
+
+# Purpose:
+#   Print the grouped split so the validation design is transparent.
+# How it works:
+#   Reports training/held-out C values and the number of snapshots in each set.
+def print_split_summary(dataset, train_indices, val_indices):
+    train_c = np.unique(dataset.raw_c_values[train_indices])
+    val_c = np.unique(dataset.raw_c_values[val_indices])
+    print("\nHeld-out-C validation split:")
+    print(f"  Training C values : {np.array2string(train_c, precision=4)}")
+    print(f"  Held-out C values : {np.array2string(val_c, precision=4)}")
+    print(f"  Training snapshots: {len(train_indices)}")
+    print(f"  Validation snapshots: {len(val_indices)}\n")
+
+
+# Purpose:
+#   Run the full conditional VAE training workflow.
+# How it works:
+#   Loads saturated snapshots, holds out full C values for validation, trains the
+#   VAE on the remaining C values, saves the model, and produces loss,
+#   reconstruction, and generation figures.
 def train():
     seed_everything(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset = SaturatedSnapshotDataset(DATA_DIR)
     image_size = dataset.image_shape[0]
-    train_len = int(TRAIN_FRACTION * len(dataset))
-    val_len = len(dataset) - train_len
-    generator = torch.Generator().manual_seed(SEED)
-    train_ds, val_ds = random_split(dataset, [train_len, val_len], generator=generator)
+    train_indices, val_indices = make_heldout_c_split(dataset, HELDOUT_C_VALUES)
+    dataset.recompute_normalization_from_indices(train_indices)
+    print_split_summary(dataset, train_indices, val_indices)
+    train_ds = Subset(dataset, train_indices)
+    val_ds = Subset(dataset, val_indices)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
@@ -351,12 +457,13 @@ def train():
         "latent_dim": LATENT_DIM,
         "image_shape": dataset.image_shape,
         "downsample_to": DOWNSAMPLE_TO,
+        "heldout_c_values": HELDOUT_C_VALUES,
     }, MODEL_OUT)
     print(f"[Success] Saved '{MODEL_OUT}'.")
 
     plot_loss_curve(history)
-    plot_reconstructions(model, dataset, device)
-    plot_generated_samples(model, dataset, device)
+    plot_reconstructions(model, dataset, device, indices=val_indices)
+    plot_generated_samples(model, dataset, device, c_values=HELDOUT_C_VALUES)
 
 
 if __name__ == "__main__":

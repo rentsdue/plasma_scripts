@@ -50,12 +50,20 @@ def seed_everything(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+# Purpose:
+#   Recover real-space grid dimensions from a real-FFT Fourier dataset.
+# How it works:
+#   Uses the stored x length and reconstructs y from the Hermitian half-spectrum.
 def infer_real_shape(uk_dataset):
     nx = uk_dataset.shape[2]
     ny = 2 * (uk_dataset.shape[3] - 1)
     return nx, ny
 
 
+# Purpose:
+#   Build a smooth scalar time series used to identify saturated turbulence.
+# How it works:
+#   Sums 1/2 k^2 |phi_k|^2 over Fourier modes for each saved frame.
 def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     series = []
     for t in range(uk.shape[0]):
@@ -65,6 +73,10 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     return np.array(series, dtype=np.float64)
 
 
+# Purpose:
+#   Build deterministic 2D statistical targets from saturated snapshots.
+# How it works:
+#   Averages RMS potential, flux, and spectral power over the saturated window.
 def extract_step4_maps(h5_file):
     c_val = h5_file["params/C"][()]
     kappa = h5_file["params/kappa"][()] if "params/kappa" in h5_file else 1.0
@@ -106,6 +118,10 @@ def extract_step4_maps(h5_file):
     }
 
 
+# Purpose:
+#   Build Step 3 deterministic 2D map regression targets.
+# How it works:
+#   Flattens saturated 2D maps for PCA/POD compression and FFNN coefficient prediction.
 class Step4MapDataset(Dataset):
     def __init__(self, data_dir, target_type="spectrum"):
         if target_type not in {"rms", "flux", "spectrum"}:
@@ -141,6 +157,10 @@ class Step4MapDataset(Dataset):
         return torch.tensor(self.inputs[idx]), torch.tensor(self.targets[idx])
 
 
+# Purpose:
+#   Predict POD/PCA coefficients from log10(C).
+# How it works:
+#   Uses a small fully connected network to output low-dimensional modal coefficients.
 class PodCoefficientFFNN(nn.Module):
     def __init__(self, input_dim=1, num_modes=4):
         super().__init__()
@@ -153,6 +173,10 @@ class PodCoefficientFFNN(nn.Module):
         return self.network(x)
 
 
+# Purpose:
+#   Convert a 2D log spectrum into a folded |kx| representation.
+# How it works:
+#   Adds +kx and -kx power in linear space, then converts back to log10 power.
 def fold_kx_log_spectrum(log_map, n_kx=LOW_KX_MODES):
     """Fold +kx and -kx in linear power, then return log10 folded spectrum."""
     n_kx = min(n_kx, (log_map.shape[0] - 1) // 2)
@@ -161,6 +185,10 @@ def fold_kx_log_spectrum(log_map, n_kx=LOW_KX_MODES):
     return np.log10(folded + EPS)
 
 
+# Purpose:
+#   Score Step 3 predictions on physically informative target regions.
+# How it works:
+#   Uses median log error for maps and focuses spectra on the folded low-mode box.
 def informative_error(pred_flat, true_flat, dataset):
     pred_map = dataset.unflatten(pred_flat)
     true_map = dataset.unflatten(true_flat)
@@ -173,6 +201,10 @@ def informative_error(pred_flat, true_flat, dataset):
     return float(np.median(np.abs(pred_fold[:, :n_ky] - true_fold[:, :n_ky])))
 
 
+# Purpose:
+#   Show one held-out Step 3 prediction beside its simulation target.
+# How it works:
+#   Plots true map, POD-FFNN map, and absolute error map for a representative C.
 def plot_validation_panel(dataset, row, output_name):
     true_map = dataset.unflatten(row["True_Target"])
     pred_map = dataset.unflatten(row["NN_Target"])
@@ -203,6 +235,10 @@ def plot_validation_panel(dataset, row, output_name):
     print(f"[Success] Saved '{output_name}'.")
 
 
+# Purpose:
+#   Inspect Step 3 spectral prediction quality across ky modes and C.
+# How it works:
+#   Reduces folded 2D spectra to mean ky profiles and plots simulation, prediction, and error.
 def plot_spectrum_mode_sweep(dataset, df, output_name):
     if dataset.target_type != "spectrum":
         return
@@ -234,6 +270,10 @@ def plot_spectrum_mode_sweep(dataset, df, output_name):
     print(f"[Success] Saved '{output_name}'.")
 
 
+# Purpose:
+#   Compare POD-FFNN error against the interpolation baseline.
+# How it works:
+#   Plots held-out median error versus C for both model families.
 def plot_error_comparison(df, target_type, output_name):
     """Plot held-out POD-FFNN error against the non-ML interpolation baseline."""
     c_values = df["C_Value"].values
@@ -251,6 +291,10 @@ def plot_error_comparison(df, target_type, output_name):
     print(f"[Success] Saved '{output_name}'.")
 
 
+# Purpose:
+#   Perform leave-one-C-out validation for a Step 3 target family.
+# How it works:
+#   Fits POD on training C values, trains an FFNN on coefficients, and compares against interpolation.
 def run_loocv(dataset, device):
     results = []
     for test_idx in range(len(dataset)):
@@ -288,6 +332,10 @@ def run_loocv(dataset, device):
     return pd.DataFrame(results).sort_values("C_Value")
 
 
+# Purpose:
+#   Train and evaluate one Step 3 target family.
+# How it works:
+#   Builds the dataset, runs LOOCV, prints errors, and saves validation figures.
 def train_one_family(target_type, device):
     dataset = Step4MapDataset(DATA_DIR, target_type=target_type)
     if target_type == "spectrum":

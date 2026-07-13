@@ -11,6 +11,10 @@ import matplotlib.pyplot as plt
 from plasma_saturation import detect_saturation_window
 
 
+# Purpose:
+#   Build a smooth scalar time series used to identify saturated turbulence.
+# How it works:
+#   Sums 1/2 k^2 |phi_k|^2 over Fourier modes for each saved frame.
 def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     series = []
     for t in range(uk.shape[0]):
@@ -23,6 +27,10 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
 # -----------------------------------------------------------------------------
 # 1. Dataset Extraction: Sliced Log-Power Targets
 # -----------------------------------------------------------------------------
+# Purpose:
+#   Build Step 1 training targets for zonal-flow log-power profiles.
+# How it works:
+#   Time-averages saturated zonal Fourier power and stores log10 profiles versus log10(C).
 class SaturatedLogPowerDataset(Dataset):
     def __init__(self, data_dir):
         self.data_dir = data_dir
@@ -73,6 +81,10 @@ class SaturatedLogPowerDataset(Dataset):
     def __len__(self): return len(self.inputs)
     def __getitem__(self, idx): return torch.tensor(self.inputs[idx]), torch.tensor(self.log_profiles[idx])
 
+# Purpose:
+#   Predict POD/PCA coefficients from log10(C).
+# How it works:
+#   Uses a small fully connected network to output low-dimensional modal coefficients.
 class PodCoefficientFFNN(nn.Module):
     def __init__(self, input_dim=1, num_modes=4):
         super(PodCoefficientFFNN, self).__init__()

@@ -33,6 +33,10 @@ ENERGY_FIG = "saturation_energy_timeseries_all_runs.png"
 SUMMARY_FIG = "saturation_window_summary.png"
 
 
+# Purpose:
+#   Find TOKAM2D HDF5 simulation runs in a scan directory.
+# How it works:
+#   Filters files using the expected hwak_C*.h5 naming convention.
 def list_hwak_files(data_dir):
     return sorted(
         f for f in os.listdir(data_dir)
@@ -40,6 +44,10 @@ def list_hwak_files(data_dir):
     )
 
 
+# Purpose:
+#   Load one run and compute its kinetic-energy saturation diagnostic.
+# How it works:
+#   Reads C, phi_k, kx, and ky from HDF5, then computes total kinetic energy.
 def load_run_energy(file_path):
     """Load one run and compute total kinetic energy versus saved timestep index."""
     with h5py.File(file_path, "r") as f:
@@ -51,6 +59,10 @@ def load_run_energy(file_path):
     return c_val, energy
 
 
+# Purpose:
+#   Generate saturation-window metadata for every C-run.
+# How it works:
+#   Detects each run's saturated window and stores rows for CSV output and plotting.
 def build_saturation_report(data_dir):
     """Scan all HDF5 runs and collect saturation metadata.
 
@@ -96,6 +108,10 @@ def build_saturation_report(data_dir):
     return rows, run_data
 
 
+# Purpose:
+#   Visually check whether saturation detection occurs after energy plateaus.
+# How it works:
+#   Plots total kinetic energy versus saved index and marks detected t_start values.
 def plot_energy_timeseries(run_data, output_path=ENERGY_FIG):
     """Plot total kinetic energy versus saved timestep index for all runs."""
     n_runs = len(run_data)
@@ -122,6 +138,10 @@ def plot_energy_timeseries(run_data, output_path=ENERGY_FIG):
     print(f"[Success] Saved '{output_path}'.")
 
 
+# Purpose:
+#   Summarize saturation-window behavior as a function of C.
+# How it works:
+#   Plots normalized onset/window fractions and marks fallback or guard-adjusted runs.
 def plot_summary(rows, output_path=SUMMARY_FIG):
     """Plot normalized onset/window diagnostics versus C."""
     df = pd.DataFrame(rows).sort_values("C")
@@ -154,6 +174,10 @@ def plot_summary(rows, output_path=SUMMARY_FIG):
     print(f"[Success] Saved '{output_path}'.")
 
 
+# Purpose:
+#   Run this script as a complete diagnostic pipeline.
+# How it works:
+#   Builds the report table, writes CSV output, and saves the diagnostic figures.
 def main():
     rows, run_data = build_saturation_report(DATA_DIR)
 

@@ -10,6 +10,10 @@ import matplotlib.pyplot as plt
 from plasma_saturation import detect_saturation_window
 
 
+# Purpose:
+#   Build a smooth scalar time series used to identify saturated turbulence.
+# How it works:
+#   Sums 1/2 k^2 |phi_k|^2 over Fourier modes for each saved frame.
 def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     series = []
     for t in range(uk.shape[0]):
@@ -22,6 +26,10 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
 # -----------------------------------------------------------------------------
 # 1. Dataset with Full Error Bar & Convergence Tracking
 # -----------------------------------------------------------------------------
+# Purpose:
+#   Build Step 0 scalar targets and uncertainty estimates for each C.
+# How it works:
+#   Extracts saturated scalar statistics for direct C-to-statistics regression.
 class MultiScalarZFDatasetWithErrorBars(Dataset):
     def __init__(self, data_dir):
         self.data_dir = data_dir
@@ -108,6 +116,10 @@ class MultiScalarZFDatasetWithErrorBars(Dataset):
 # -----------------------------------------------------------------------------
 # 2. Neural Network Architecture
 # -----------------------------------------------------------------------------
+# Purpose:
+#   Step 0 feedforward neural network for scalar regression.
+# How it works:
+#   Maps log10(C) through fully connected layers to scalar plasma statistics.
 class ScalarFFNN(nn.Module):
     def __init__(self, input_dim=1, output_dim=3):
         super(ScalarFFNN, self).__init__()
@@ -123,6 +135,10 @@ class ScalarFFNN(nn.Module):
 # -----------------------------------------------------------------------------
 # 3. Execution & LOOCV Loop
 # -----------------------------------------------------------------------------
+# Purpose:
+#   Make model training and validation reproducible.
+# How it works:
+#   Seeds NumPy and PyTorch random number generators.
 def set_seed(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)

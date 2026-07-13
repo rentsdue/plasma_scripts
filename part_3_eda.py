@@ -21,6 +21,10 @@ DATA_DIR = "/zhisongqu_data/ameir/guillon_dns_triad/scan_IIIA_512"
 EPS = 1e-20
 
 
+# Purpose:
+#   Build a smooth scalar time series used to identify saturated turbulence.
+# How it works:
+#   Sums 1/2 k^2 |phi_k|^2 over Fourier modes for each saved frame.
 def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     series = []
     for t in range(uk.shape[0]):
@@ -30,6 +34,10 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     return np.array(series, dtype=np.float64)
 
 
+# Purpose:
+#   Recover real-space grid dimensions from a real-FFT Fourier dataset.
+# How it works:
+#   Uses the stored x length and reconstructs y from the Hermitian half-spectrum.
 def infer_real_shape(uk_dataset):
     """
     Infer real-space grid shape from rfft2-style storage.
@@ -46,6 +54,10 @@ def infer_real_shape(uk_dataset):
     return nx, ny
 
 
+# Purpose:
+#   Build deterministic 2D statistical targets from saturated snapshots.
+# How it works:
+#   Averages RMS potential, flux, and spectral power over the saturated window.
 def extract_step4_maps(h5_file):
     """
     Extract Step 4 time-averaged 2D targets from one HDF5 simulation file.
@@ -116,6 +128,10 @@ def extract_step4_maps(h5_file):
     }
 
 
+# Purpose:
+#   Build Step 3 EDA targets for 2D statistical maps.
+# How it works:
+#   Extracts saturated RMS, flux, and spectrum maps for smoothness/POD checks.
 class Saturated2DMapEDADataset:
     def __init__(self, data_dir):
         self.data_dir = data_dir
