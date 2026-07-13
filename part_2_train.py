@@ -102,6 +102,31 @@ class PodSpectraFFNN(nn.Module):
         )
     def forward(self, x): return self.network(x)
 
+
+def plot_family_error_breakdown(df, output_path="step2_spectra_family_error_breakdown.png"):
+    """Save a supplementary per-family ML-vs-interpolation error diagnostic."""
+    log10_c_axis = np.log10(df['C_Value'].values)
+    families = [
+        (r"$E(k_x)$", "NN_Ex", "Base_Ex", "#1f77b4"),
+        (r"$E(k_y)$", "NN_Ey", "Base_Ey", "#d62728"),
+        (r"$E_{ZF}$", "NN_Zf", "Base_Zf", "#2ca02c"),
+    ]
+
+    fig, axs = plt.subplots(1, 3, figsize=(15, 4.5), sharey=True)
+    for ax, (title, nn_col, base_col, color) in zip(axs, families):
+        ax.plot(log10_c_axis, df[nn_col].values, color=color, marker='o', lw=2, label='POD-FFNN')
+        ax.plot(log10_c_axis, df[base_col].values, color=color, marker='s', linestyle='--', lw=1.8, alpha=0.75, label='Interpolation')
+        ax.set_title(f"{title} error")
+        ax.set_xlabel(r"Adiabaticity $\log_{10}(C)$")
+        ax.grid(True, which="both", alpha=0.35, linestyle=':')
+
+    axs[0].set_ylabel("Median absolute error [dex]")
+    axs[-1].legend(loc='best', fontsize=8)
+    fig.suptitle("Step 2 per-family spectrum error breakdown", fontweight='bold')
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220)
+    print(f"\n[Success] Supplementary error breakdown saved to '{output_path}'")
+
 # -----------------------------------------------------------------------------
 # 2. Main Execution Engine: LOOCV Loop with Sub-Slice Analysis
 # -----------------------------------------------------------------------------
@@ -225,15 +250,11 @@ if __name__ == "__main__":
     axs[1].set_ylabel(r"Adiabaticity $\log_{10}(C)$")
     fig.colorbar(im1, ax=axs[1], label=r"Zonal kinetic energy $\log_{10} E_{ZF}$")
     
-    # Panel 7c: Comparative Multi-Family Error Panel with Baseline Overlay
-    axs[2].plot(log10_c_axis, df['NN_Global'].values, color='black', marker='o', lw=2, label='All spectra: POD-FFNN')
-    axs[2].plot(log10_c_axis, df['Base_Global'].values, color='black', linestyle='--', alpha=0.6, label='All spectra: interpolation')
-    
-    axs[2].plot(log10_c_axis, df['NN_Ex'].values, color='#1f77b4', marker='s', alpha=0.8, label=r'$E(k_x)$: POD-FFNN')
-    axs[2].plot(log10_c_axis, df['Base_Ex'].values, color='#1f77b4', linestyle=':', alpha=0.5)
-    
-    axs[2].plot(log10_c_axis, df['NN_Zf'].values, color='#2ca02c', marker='^', alpha=0.8, label=r'$E_{ZF}$: POD-FFNN')
-    axs[2].plot(log10_c_axis, df['Base_Zf'].values, color='#2ca02c', linestyle=':', alpha=0.5)
+    # Panel 7c: Poster-friendly global error comparison.
+    # Detailed E(kx), E(ky), and zonal comparisons are saved separately by
+    # plot_family_error_breakdown() to keep this main figure uncluttered.
+    axs[2].plot(log10_c_axis, df['NN_Global'].values, color='black', marker='o', lw=2.2, label='POD-FFNN')
+    axs[2].plot(log10_c_axis, df['Base_Global'].values, color='#ff7f0e', marker='s', linestyle='--', lw=2.0, label='Linear interpolation baseline')
     
     axs[2].set_title("Prediction Error Compared with Interpolation", fontsize=11)
     axs[2].set_xlabel(r"Adiabaticity $\log_{10}(C)$")
@@ -245,3 +266,4 @@ if __name__ == "__main__":
     output_image_name = "step2_spectra_validation_performance.png"
     plt.savefig(output_image_name, dpi=220)
     print(f"\n[Success] Refined diagnostic graphics compiled to '{output_image_name}'")
+    plot_family_error_breakdown(df)

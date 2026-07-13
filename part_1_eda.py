@@ -94,7 +94,7 @@ if __name__ == "__main__":
         lbl = f"C={dataset.raw_c_values[idx]:.3e}"
         plt.plot(modes_axis, dataset.log_profiles[idx], color=colors[idx], alpha=0.8, lw=1.5, label=lbl)
         
-    plt.title(r"Zonal-Flow Power Spectra Vary Smoothly with $C$")
+    plt.title(r"Zonal-Flow Power vs Adiabaticity Parameter $C$")
     plt.xlabel(r"Radial mode number $m$")
     plt.ylabel(r"Zonal-flow power, $\log_{10} P_{ZF}(m; C)$")
     plt.xlim(1, 64)  # Focus display strictly on informative modes

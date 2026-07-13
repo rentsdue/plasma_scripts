@@ -171,6 +171,7 @@ if __name__ == "__main__":
 
     log10_c_axis = np.log10(df['C_Value'].values)
     nn_dex_errors = df['NN_DEX'].values
+    base_dex_errors = df['Base_DEX'].values
     
     # DISPLAY CROP ADJUSTMENT: Limit horizontal axis visualization to modes 1 to 64
     modes_axis = np.arange(1, 65)
@@ -199,6 +200,7 @@ if __name__ == "__main__":
     
     # Panel 6c: Performance Curve using Median Deviation (DEX)
     axs[2].plot(log10_c_axis, nn_dex_errors, marker='o', color='#1f77b4', linewidth=2, markersize=6, label='POD-FFNN prediction')
+    axs[2].plot(log10_c_axis, base_dex_errors, marker='s', color='#ff7f0e', linestyle='--', linewidth=2, markersize=5, label='Linear interpolation baseline')
     axs[2].set_title(r"Median Spectrum Error vs $C$", fontsize=12)
     axs[2].set_xlabel(r"Adiabaticity $\log_{10}(C)$", fontsize=11)
     axs[2].set_ylabel("Median absolute error [dex]", fontsize=11)

@@ -234,6 +234,23 @@ def plot_spectrum_mode_sweep(dataset, df, output_name):
     print(f"[Success] Saved '{output_name}'.")
 
 
+def plot_error_comparison(df, target_type, output_name):
+    """Plot held-out POD-FFNN error against the non-ML interpolation baseline."""
+    c_values = df["C_Value"].values
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    ax.plot(c_values, df["NN_DEX"].values, marker="o", lw=2.2, label="POD-FFNN prediction")
+    ax.plot(c_values, df["Base_DEX"].values, marker="s", lw=2.0, ls="--", label="Linear interpolation baseline")
+    ax.set_xscale("log")
+    ax.set_xlabel(r"Adiabaticity $C$")
+    ax.set_ylabel("Median absolute error [dex]")
+    ax.set_title(f"Step 3 {target_type} map error: ML vs interpolation")
+    ax.grid(True, which="both", alpha=0.3, linestyle=":")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(output_name, dpi=200)
+    print(f"[Success] Saved '{output_name}'.")
+
+
 def run_loocv(dataset, device):
     results = []
     for test_idx in range(len(dataset)):
@@ -285,6 +302,7 @@ def train_one_family(target_type, device):
     for _, row in df.iterrows():
         print(f"C={row['C_Value']:<10.4g} | NN={row['NN_DEX']:<8.4f} dex | baseline={row['Base_DEX']:<8.4f} dex")
     sample_row = df.iloc[len(df) // 2]
+    plot_error_comparison(df, target_type, f"step3_{target_type}_error_comparison.png")
     plot_validation_panel(dataset, sample_row, f"step3_{target_type}_2d_map_validation.png")
     if target_type == "spectrum":
         plot_spectrum_mode_sweep(dataset, df, "step3_spectrum_mode_space_sweep.png")
