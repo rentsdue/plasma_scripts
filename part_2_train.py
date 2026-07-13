@@ -234,8 +234,26 @@ if __name__ == "__main__":
     print("\n" + "="*125)
     print(f"{'STEP 2 DE-COUPLED SPECTRUM ERROR REVIEW (VALUES IN DEX DECADES)':^125}")
     print("="*125)
-    
-        # Create the header string using single quotes only
+
+    header = (
+        f"{'C-Value':<10} | {'Type':<8} | "
+        f"{'NN Global':<10} | {'Base Global':<11} | "
+        f"{'NN E(kx)':<10} | {'Base E(kx)':<11} | "
+        f"{'NN E(ky)':<10} | {'Base E(ky)':<11} | "
+        f"{'NN ZF':<10} | {'Base ZF':<10}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for _, row in df.iterrows():
+        print(
+            f"{row['C_Value']:<10.4g} | {row['Type']:<8} | "
+            f"{row['NN_Global']:<10.4f} | {row['Base_Global']:<11.4f} | "
+            f"{row['NN_Ex']:<10.4f} | {row['Base_Ex']:<11.4f} | "
+            f"{row['NN_Ey']:<10.4f} | {row['Base_Ey']:<11.4f} | "
+            f"{row['NN_Zf']:<10.4f} | {row['Base_Zf']:<10.4f}"
+        )
+    print("=" * len(header))
 
     # -----------------------------------------------------------------------------
     # 4. Comparative Plot Generation

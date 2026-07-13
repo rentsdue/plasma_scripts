@@ -1,4 +1,4 @@
-"""Quick-look plot for a completed Tokam2D simulation.
+"""Quick-look plots for completed Tokam2D simulations or scan HDF5 files.
 
 Run from the project root and provide the simulation output folder:
 
@@ -10,6 +10,13 @@ Or from inside the results folder:
     python analyze.py test_1
 
 The input folder must contain ``simulation_fields.h5``.
+
+This version also supports the scan files used by the ML scripts:
+
+    python analyze.py /path/to/scan_IIIA_512
+    python analyze.py /path/to/hwak_C0.5.h5
+
+If a directory contains ``hwak_C*.h5`` files, all matching files are analyzed.
 """
 
 import argparse
@@ -26,6 +33,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_SCAN_OUTPUT_DIR = "scan_analysis_outputs"
 
 
 def find_project_root(start: Path) -> Path:
@@ -39,11 +47,22 @@ def find_project_root(start: Path) -> Path:
     )
 
 
-PROJECT_ROOT = find_project_root(SCRIPT_DIR)
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+try:
+    PROJECT_ROOT = find_project_root(SCRIPT_DIR)
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from diagnostics.simulation_diag_handler import Simulation, set_plot_defaults  # noqa: E402
+except Exception as exc:  # pragma: no cover - used when only scan-HDF5 mode is needed
+    PROJECT_ROOT = None
+    Simulation = None
 
-from diagnostics.simulation_diag_handler import Simulation, set_plot_defaults  # noqa: E402
+    def set_plot_defaults():
+        """Fallback plot defaults when Tokam2D diagnostics are unavailable."""
+        plt.rcParams.update({"figure.dpi": 120})
+
+    TOKAM2D_IMPORT_ERROR = exc
+else:
+    TOKAM2D_IMPORT_ERROR = None
 
 
 def require_python_environment() -> None:
@@ -77,12 +96,21 @@ def require_file(path: Path, description: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a quick-look final-state plot for a Tokam2D simulation."
+        description="Create quick-look plots for a Tokam2D folder or hwak_C*.h5 scan files."
     )
     parser.add_argument(
-        "sim_folder",
+        "input_path",
         type=Path,
-        help="Simulation output folder containing simulation_fields.h5",
+        help=(
+            "Either a Tokam2D output folder containing simulation_fields.h5, "
+            "a directory containing hwak_C*.h5 scan files, or one hwak_C*.h5 file."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(DEFAULT_SCAN_OUTPUT_DIR),
+        help="Output directory for scan-HDF5 plots and summary CSV.",
     )
     return parser.parse_args()
 
@@ -345,11 +373,169 @@ def save_final_state_plots(
     return output_paths
 
 
-def main() -> None:
+# Purpose:
+#   Find the ML scan files in a directory.
+# How it works:
+#   Selects all files matching hwak_C*.h5 and sorts them by the C value stored
+#   inside the file when possible, falling back to filename order otherwise.
+def list_scan_h5_files(data_dir: Path) -> list[Path]:
+    files = sorted(data_dir.glob("hwak_C*.h5"))
+
+    def c_sort_key(path: Path):
+        try:
+            with h5py.File(path, "r") as f:
+                return float(f["params/C"][()])
+        except Exception:
+            return path.name
+
+    return sorted(files, key=c_sort_key)
+
+
+# Purpose:
+#   Infer the real-space grid shape from the scan-file Fourier array.
+# How it works:
+#   The scan files store real-FFT data with shape [time, channel, nx, ny//2+1],
+#   so the full real-space y length is 2*(stored_y_length - 1).
+def infer_scan_real_shape(uk_dataset) -> tuple[int, int]:
+    nx = uk_dataset.shape[2]
+    ny = 2 * (uk_dataset.shape[3] - 1)
+    return nx, ny
+
+
+# Purpose:
+#   Reconstruct final density, potential, and vorticity fields from one scan HDF5 file.
+# How it works:
+#   Reads the final Fourier snapshot, applies irfft2 to density and potential,
+#   and computes vorticity as omega_k = -k^2 phi_k before transforming to real space.
+def load_final_scan_fields(h5_path: Path) -> dict:
+    with h5py.File(h5_path, "r") as f:
+        c_val = float(f["params/C"][()]) if "params/C" in f else np.nan
+        uk = f["fields/uk"]
+        kx2d = f["data/kx"][()]
+        ky2d = f["data/ky"][()]
+        nx, ny = infer_scan_real_shape(uk)
+        final_idx = uk.shape[0] - 1
+
+        phi_k = uk[final_idx, 0, :, :]
+        if "fields/nk" in f:
+            n_k = f["fields/nk"][final_idx, 0, :, :]
+        else:
+            n_k = uk[final_idx, 1, :, :]
+
+        k2 = kx2d**2 + ky2d**2
+        omega_k = -k2 * phi_k
+
+        phi = np.fft.irfft2(phi_k, s=(nx, ny), norm="forward")
+        density = np.fft.irfft2(n_k, s=(nx, ny), norm="forward")
+        vorticity = np.fft.irfft2(omega_k, s=(nx, ny), norm="forward")
+
+    return {
+        "file": h5_path.name,
+        "C": c_val,
+        "T": final_idx + 1,
+        "nx": nx,
+        "ny": ny,
+        "fields": {
+            "density": density,
+            "potential": phi,
+            "vorticity": vorticity,
+        },
+    }
+
+
+# Purpose:
+#   Save one final-state field image from a scan HDF5 file.
+# How it works:
+#   Uses imshow with robust percentile color limits so all scan-file plots are
+#   directly readable even when amplitudes vary strongly across C.
+def save_scan_field_plot(data: np.ndarray, field: str, c_val: float, output_image: Path) -> None:
+    vmin, vmax = np.nanpercentile(data, [2, 98])
+    if vmin == vmax:
+        vmin, vmax = float(np.nanmin(data)), float(np.nanmax(data))
+    if vmin == vmax:
+        vmax = vmin + 1.0
+
+    fig, ax = plt.subplots(figsize=(5.2, 4.6), dpi=140)
+    im = ax.imshow(data, origin="lower", cmap=field_colormap(field), vmin=vmin, vmax=vmax)
+    ax.set_title(f"{field_label(field)} final state, C={c_val:.4g}")
+    ax.set_xlabel("y index")
+    ax.set_ylabel("x index")
+    plt.colorbar(im, ax=ax, fraction=0.046, label=field_label(field))
+    fig.tight_layout()
+    fig.savefig(output_image, dpi=220)
+    plt.close(fig)
+
+
+# Purpose:
+#   Analyze one direct hwak_C*.h5 scan file.
+# How it works:
+#   Reconstructs final density, potential, and vorticity fields, saves plots,
+#   and returns scalar RMS values for the scan summary CSV.
+def analyze_one_scan_file(h5_path: Path, output_dir: Path) -> dict:
+    data = load_final_scan_fields(h5_path)
+    c_val = data["C"]
+    safe_c = f"C_{c_val:.6g}".replace(".", "p").replace("-", "m")
+    file_stem = h5_path.stem
+    row = {
+        "file": data["file"],
+        "C": c_val,
+        "T": data["T"],
+        "nx": data["nx"],
+        "ny": data["ny"],
+    }
+
+    for field, field_data in data["fields"].items():
+        output_image = output_dir / f"{safe_c}_{file_stem}_{field}.png"
+        save_scan_field_plot(field_data, field, c_val, output_image)
+        row[f"{field}_rms"] = float(np.sqrt(np.mean(field_data**2)))
+        row[f"{field}_min"] = float(np.min(field_data))
+        row[f"{field}_max"] = float(np.max(field_data))
+        print(f"Saved scan plot: {output_image}")
+
+    return row
+
+
+# Purpose:
+#   Analyze all 17 scan-style simulation files in a directory.
+# How it works:
+#   Loops through hwak_C*.h5 files, analyzes each final state, and writes a CSV
+#   containing C, grid size, number of snapshots, and basic field amplitudes.
+def analyze_scan_directory(input_path: Path, output_dir: Path) -> None:
+    files = [input_path] if input_path.is_file() else list_scan_h5_files(input_path)
+    if not files:
+        raise FileNotFoundError(f"No hwak_C*.h5 files found in {input_path}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Found {len(files)} scan HDF5 file(s).")
+    print(f"Writing scan analysis outputs to: {output_dir}")
+
+    rows = []
+    for h5_path in files:
+        print(f"\nAnalyzing scan file: {h5_path}")
+        rows.append(analyze_one_scan_file(h5_path, output_dir))
+
+    summary_path = output_dir / "scan_analysis_summary.csv"
+    columns = list(rows[0].keys())
+    with summary_path.open("w", encoding="utf-8") as f:
+        f.write(",".join(columns) + "\n")
+        for row in rows:
+            f.write(",".join(str(row.get(col, "")) for col in columns) + "\n")
+    print(f"\nSaved scan summary CSV: {summary_path}")
+
+
+# Purpose:
+#   Preserve the original single-folder Tokam2D analysis path.
+# How it works:
+#   Loads simulation_fields.h5 through Tokam2D diagnostics, saves particle flux,
+#   and creates final-state plots for density, vorticity, and potential.
+def analyze_tokam2d_folder(sim_folder: Path) -> None:
     require_python_environment()
-    args = parse_args()
-    set_plot_defaults()
-    sim_folder = args.sim_folder.expanduser().resolve()
+    if Simulation is None:
+        raise RuntimeError(
+            "Tokam2D diagnostics could not be imported, so folder mode is unavailable. "
+            f"Original import error: {TOKAM2D_IMPORT_ERROR}"
+        )
+
     fields_path = sim_folder / "simulation_fields.h5"
     metadata_path = sim_folder / "metadata.h5"
 
@@ -417,6 +603,33 @@ def main() -> None:
                 print("metadata.h5 exists, but has no 'simulation_duration' dataset.")
     else:
         print("metadata.h5 not found; skipping runtime summary.")
+
+
+def main() -> None:
+    args = parse_args()
+    set_plot_defaults()
+    input_path = args.input_path.expanduser().resolve()
+    output_dir = args.output_dir.expanduser().resolve()
+
+    if input_path.is_file() and input_path.name.startswith("hwak_C") and input_path.suffix == ".h5":
+        analyze_scan_directory(input_path, output_dir)
+        return
+
+    if input_path.is_dir() and (input_path / "simulation_fields.h5").exists():
+        analyze_tokam2d_folder(input_path)
+        return
+
+    if input_path.is_dir() and list_scan_h5_files(input_path):
+        analyze_scan_directory(input_path, output_dir)
+        return
+
+    raise FileNotFoundError(
+        "Input path is not a recognized analysis target. Expected one of:\n"
+        "  1. Tokam2D folder containing simulation_fields.h5\n"
+        "  2. Directory containing hwak_C*.h5 scan files\n"
+        "  3. Single hwak_C*.h5 scan file\n"
+        f"Received: {input_path}"
+    )
 
 
 if __name__ == "__main__":
