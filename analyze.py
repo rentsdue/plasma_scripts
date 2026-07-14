@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_SCAN_DATA_DIR = Path("/zhisongqu_data/ameir/guillon_dns_triad/scan_IIIA_512")
 DEFAULT_SCAN_OUTPUT_DIR = "scan_analysis_outputs"
 
 
@@ -115,6 +116,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_input_path(input_path: Path) -> Path:
+    """Resolve user input, falling back to the default scan data directory."""
+    expanded = input_path.expanduser()
+    if expanded.exists():
+        return expanded.resolve()
+
+    if not expanded.is_absolute():
+        default_candidate = DEFAULT_SCAN_DATA_DIR / expanded
+        if default_candidate.exists():
+            return default_candidate.resolve()
+
+    return expanded.resolve()
+
+
 def select_field(h5_file: h5py.File) -> tuple[str, str]:
     preferred = [
         ("density", "Density"),
@@ -149,6 +164,16 @@ def field_label(field: str) -> str:
         "VEy": "Poloidal ExB velocity",
     }
     return labels.get(field, field)
+
+
+def scan_field_title_label(field: str) -> str:
+    """Return the requested scan-plot title label with field symbols."""
+    labels = {
+        "density": "Density (n)",
+        "potential": "Potential (φ)",
+        "vorticity": "Vorticity (ω)",
+    }
+    return labels.get(field, field_label(field))
 
 
 def read_scalar(sim: Simulation, key: str):
@@ -449,20 +474,43 @@ def load_final_scan_fields(h5_path: Path) -> dict:
 #   Uses imshow with robust percentile color limits so all scan-file plots are
 #   directly readable even when amplitudes vary strongly across C.
 def save_scan_field_plot(data: np.ndarray, field: str, c_val: float, output_image: Path) -> None:
-    vmin, vmax = np.nanpercentile(data, [2, 98])
-    if vmin == vmax:
-        vmin, vmax = float(np.nanmin(data)), float(np.nanmax(data))
+    vmin = float(np.nanmin(data))
+    vmax = float(np.nanmax(data))
     if vmin == vmax:
         vmax = vmin + 1.0
 
-    fig, ax = plt.subplots(figsize=(5.2, 4.6), dpi=140)
-    im = ax.imshow(data, origin="lower", cmap=field_colormap(field), vmin=vmin, vmax=vmax)
-    ax.set_title(f"{field_label(field)} final state, C={c_val:.4g}")
-    ax.set_xlabel("y index")
-    ax.set_ylabel("x index")
-    plt.colorbar(im, ax=ax, fraction=0.046, label=field_label(field))
-    fig.tight_layout()
-    fig.savefig(output_image, dpi=220)
+    normalized_data = normalize_frame(data, vmin, vmax)
+    nx, ny = normalized_data.shape
+
+    fig = plt.figure(figsize=(5.6, 5.6), dpi=140)
+    plot_left = 0.12
+    plot_bottom = 0.12
+    plot_width = 0.72
+    plot_height = 0.72
+    ax = fig.add_axes([plot_left, plot_bottom, plot_width, plot_height])
+    cax = fig.add_axes([plot_left + plot_width + 0.04, plot_bottom, 0.025, plot_height])
+
+    im = ax.imshow(
+        normalized_data.T,
+        origin="lower",
+        cmap=field_colormap(field),
+        vmin=0.0,
+        vmax=1.0,
+        extent=[0, nx, 0, ny],
+        aspect="equal",
+    )
+    ax.set_title(f"{scan_field_title_label(field)} for C = {c_val:.4g}", fontsize=12, pad=10)
+    ax.set_xlabel(r"x [$\rho_0$]", fontsize=10)
+    ax.set_ylabel(r"y [$\rho_0$]", fontsize=10)
+    ax.tick_params(labelsize=9)
+    ax.grid(color="0.6", linewidth=0.8, alpha=0.55)
+
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_ticks(np.linspace(0.0, 1.0, 6))
+    cbar.ax.tick_params(labelsize=9)
+    cbar.set_label(f"Normalized {field_label(field)}", fontsize=10)
+
+    fig.savefig(output_image, dpi=300, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
 
 
@@ -608,7 +656,7 @@ def analyze_tokam2d_folder(sim_folder: Path) -> None:
 def main() -> None:
     args = parse_args()
     set_plot_defaults()
-    input_path = args.input_path.expanduser().resolve()
+    input_path = resolve_input_path(args.input_path)
     output_dir = args.output_dir.expanduser().resolve()
 
     if input_path.is_file() and input_path.name.startswith("hwak_C") and input_path.suffix == ".h5":

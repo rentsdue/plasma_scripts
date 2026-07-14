@@ -1,4 +1,5 @@
 import os
+import random
 import h5py
 import numpy as np
 import torch
@@ -9,6 +10,25 @@ from sklearn.decomposition import PCA
 import pandas as pd
 import matplotlib.pyplot as plt
 from plasma_saturation import detect_saturation_window
+
+
+SEED = 42
+
+
+# Purpose:
+#   Make Step 1 POD-FFNN training reproducible.
+# How it works:
+#   Seeds Python, NumPy, PyTorch, CUDA, and configures cuDNN for deterministic kernels.
+def seed_everything(seed=SEED):
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # Purpose:
@@ -101,6 +121,7 @@ class PodCoefficientFFNN(nn.Module):
 # 3. Main Processing Pipeline
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    seed_everything(SEED)
     DATA_DIR = "/zhisongqu_data/ameir/guillon_dns_triad/scan_IIIA_512"
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -217,7 +238,7 @@ if __name__ == "__main__":
     axs[2].set_xlabel(r"Adiabaticity $\log_{10}(C)$", fontsize=11)
     axs[2].set_ylabel("Median absolute error [dex]", fontsize=11)
     axs[2].grid(True, which="both", alpha=0.35, linestyle=':')
-    axs[2].legend(loc='upper right')
+    axs[2].legend(loc='upper left', fontsize=8, frameon=True)
     
     plt.tight_layout()
     output_image_name = "step1_fourier_validation_performance_log.png"
