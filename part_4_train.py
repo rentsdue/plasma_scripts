@@ -35,14 +35,19 @@ BATCH_SIZE = 16
 EPOCHS = 80
 LR = 1e-3
 LATENT_DIM = 64
-BETA_KL = 1e-4
+BETA_KL = 1e-3
+KL_WARMUP_EPOCHS = 20
+N_FIELDS = 3  # [density n, potential phi, vorticity omega]
 PREFERRED_HELDOUT_C_VALUES = [0.1, 0.5, 3.0]
 N_HELDOUT_C_VALUES = 3
 
-MODEL_OUT = "part4_cvae_model.pt"
-LOSS_FIG = "part4_cvae_loss_curve.png"
-RECON_FIG = "part4_reconstruction_examples.png"
-GEN_FIG = "part4_generated_snapshots.png"
+MODEL_OUT = "step4_cvae_model.pt"
+LOSS_FIG = "step4_cvae_loss_curve.png"
+RECON_FIG = "step4_reconstruction_examples.png"
+GEN_FIG = "step4_generated_snapshots.png"
+
+FIELD_NAMES = ["n", "phi", "omega"]
+FIELD_LABELS = [r"$n$", r"$\phi$", r"$\omega$"]
 
 
 # Purpose:
@@ -108,11 +113,11 @@ def downsample_image_np(image, size):
 # How it works:
 #   For each C-run, it detects the saturated window, transforms density and
 #   potential from Fourier space to real space, optionally downsamples, and
-#   stores [density, potential] images conditioned on log10(C).
+#   stores [density, potential, vorticity] images conditioned on log10(C).
 # Architecture role:
-#   Provides samples from p([n, phi] | C) for the conditional VAE.
+#   Provides samples from p([n, phi, omega] | C) for the conditional VAE.
 class SaturatedSnapshotDataset(Dataset):
-    """Dataset of saturated real-space snapshots [density, potential] conditioned on log10(C)."""
+    """Dataset of saturated real-space snapshots [density, potential, vorticity] conditioned on log10(C)."""
 
     def __init__(self, data_dir, downsample_to=DOWNSAMPLE_TO, max_snapshots_per_c=MAX_SNAPSHOTS_PER_C):
         self.data_dir = data_dir
@@ -124,7 +129,7 @@ class SaturatedSnapshotDataset(Dataset):
         )
 
         self.conditions = []  # log10(C)
-        self.images = []      # [2, H, W], channels = [density, potential]
+        self.images = []      # [3, H, W], channels = [density, potential, vorticity]
         self.raw_c_values = []
         self.image_shape = None
         self.channel_mean = None
@@ -133,7 +138,7 @@ class SaturatedSnapshotDataset(Dataset):
         self._process_files()
 
     def _process_files(self):
-        print("Extracting saturated [n, phi] snapshots for conditional VAE...")
+        print("Extracting saturated [n, φ, ω] snapshots for conditional VAE...")
 
         for file_name in self.file_list:
             file_path = os.path.join(self.data_dir, file_name)
@@ -158,11 +163,13 @@ class SaturatedSnapshotDataset(Dataset):
                 for t in all_indices:
                     phi_k = uk[t, 0, :, :]
                     n_k = f["fields/nk"][t, 0, :, :] if "fields/nk" in f else uk[t, 1, :, :]
+                    omega_k = -(kx2d**2 + ky2d**2) * phi_k
 
                     phi = np.fft.irfft2(phi_k, s=(nx, ny), norm="forward")
                     density = np.fft.irfft2(n_k, s=(nx, ny), norm="forward")
+                    omega = np.fft.irfft2(omega_k, s=(nx, ny), norm="forward")
 
-                    image = np.stack([density, phi], axis=0)
+                    image = np.stack([density, phi, omega], axis=0)
                     image = downsample_image_np(image, self.downsample_to)
 
                     self.conditions.append([log_c])
@@ -182,15 +189,15 @@ class SaturatedSnapshotDataset(Dataset):
         self.channel_std = (train_images.std(axis=(0, 2, 3), keepdims=True) + 1e-8).astype(np.float32)
         self.images = (self.images - self.channel_mean) / self.channel_std
         print("Channel normalization fitted on training C values only:")
-        print(f"  density mean/std = {self.channel_mean.ravel()[0]:.4e} / {self.channel_std.ravel()[0]:.4e}")
-        print(f"  phi     mean/std = {self.channel_mean.ravel()[1]:.4e} / {self.channel_std.ravel()[1]:.4e}")
+        for idx, label in enumerate(["n", "φ", "ω"]):
+            print(f"  {label:<7} mean/std = {self.channel_mean.ravel()[idx]:.4e} / {self.channel_std.ravel()[idx]:.4e}")
 
     def denormalize(self, x):
-        """Denormalize torch or numpy tensor with shape [..., 2, H, W]. Returns numpy."""
+        """Denormalize torch or numpy tensor with shape [..., N_FIELDS, H, W]. Returns numpy."""
         if isinstance(x, torch.Tensor):
             x = x.detach().cpu().numpy()
-        mean = self.channel_mean.reshape(1, 2, 1, 1)
-        std = self.channel_std.reshape(1, 2, 1, 1)
+        mean = self.channel_mean.reshape(1, N_FIELDS, 1, 1)
+        std = self.channel_std.reshape(1, N_FIELDS, 1, 1)
         return x * std + mean
 
     def unique_c_values(self):
@@ -206,9 +213,9 @@ class SaturatedSnapshotDataset(Dataset):
 # Purpose:
 #   Conditional variational autoencoder for saturated plasma snapshots.
 # How it works:
-#   The encoder receives [density, potential, log10(C)-channel] and maps each
+#   The encoder receives [density, potential, vorticity, log10(C)-channel] and maps each
 #   image to a Gaussian latent distribution. The decoder receives a random
-#   latent vector z plus log10(C), then generates a plausible [density, phi]
+#   latent vector z plus log10(C), then generates a plausible [density, phi, omega]
 #   snapshot for that condition.
 class ConditionalVAE(nn.Module):
     def __init__(self, image_size=128, latent_dim=LATENT_DIM):
@@ -220,9 +227,9 @@ class ConditionalVAE(nn.Module):
         self.reduced_size = image_size // 16
         self.enc_flat_dim = 256 * self.reduced_size * self.reduced_size
 
-        # Encoder receives [density, phi, C_channel]
+        # Encoder receives [density, phi, omega, C_channel]
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, 4, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(N_FIELDS + 1, 32, 4, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(32, 64, 4, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(64, 128, 4, stride=2, padding=1), nn.ReLU(),
             nn.Conv2d(128, 256, 4, stride=2, padding=1), nn.ReLU(),
@@ -237,7 +244,7 @@ class ConditionalVAE(nn.Module):
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.ReLU(),
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1), nn.ReLU(),
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), nn.ReLU(),
-            nn.ConvTranspose2d(32, 2, 4, stride=2, padding=1),
+            nn.ConvTranspose2d(32, N_FIELDS, 4, stride=2, padding=1),
         )
 
     def encode(self, x, c):
@@ -276,15 +283,24 @@ def vae_loss(recon, x, mu, logvar, beta=BETA_KL):
     return recon_loss + beta * kl_loss, recon_loss, kl_loss
 
 
+def robust_symmetric_limits(*arrays, percentile=99.0):
+    values = np.concatenate([np.ravel(np.asarray(arr)) for arr in arrays])
+    limit = np.nanpercentile(np.abs(values), percentile)
+    if not np.isfinite(limit) or limit <= 0:
+        limit = 1.0
+    return -limit, limit
+
+
 # Purpose:
 #   Visualize VAE training progress.
 # How it works:
 #   Plots total, reconstruction, and KL losses across epochs on a log scale.
 def plot_loss_curve(history):
     plt.figure(figsize=(8, 5))
-    plt.plot(history["loss"], label="total loss")
-    plt.plot(history["recon"], label="reconstruction loss")
-    plt.plot(history["kl"], label="KL loss")
+    plt.plot(history["train_loss"], label="train total loss")
+    plt.plot(history["train_recon"], label="train reconstruction")
+    plt.plot(history["val_recon"], label="held-out C reconstruction")
+    plt.plot(history["weighted_kl"], label=r"weighted KL, $\beta D_{KL}$")
     plt.yscale("log")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
@@ -310,27 +326,34 @@ def plot_reconstructions(model, dataset, device, indices=None, n_examples=3):
         indices = np.array(indices, dtype=int)
         n_examples = min(n_examples, len(indices))
         indices = indices[np.linspace(0, len(indices) - 1, n_examples, dtype=int)]
-    fig, axs = plt.subplots(n_examples, 4, figsize=(12, 3.2 * n_examples))
-    if n_examples == 1:
+    fig, axs = plt.subplots(N_FIELDS, 3, figsize=(10.5, 9.0))
+    if N_FIELDS == 1:
         axs = axs[None, :]
 
     with torch.no_grad():
-        for row, idx in enumerate(indices):
-            x, c = dataset[idx]
-            x_b = x.unsqueeze(0).to(device)
-            c_b = c.unsqueeze(0).to(device)
-            recon, _, _ = model(x_b, c_b)
-            true_np = dataset.denormalize(x_b)[0]
-            recon_np = dataset.denormalize(recon)[0]
-            c_val = 10 ** float(c.item())
+        idx = indices[len(indices) // 2]
+        x, c = dataset[idx]
+        x_b = x.unsqueeze(0).to(device)
+        c_b = c.unsqueeze(0).to(device)
+        recon, _, _ = model(x_b, c_b)
+        true_np = dataset.denormalize(x_b)[0]
+        recon_np = dataset.denormalize(recon)[0]
+        err_np = recon_np - true_np
+        c_val = 10 ** float(c.item())
 
-            panels = [true_np[0], recon_np[0], true_np[1], recon_np[1]]
-            titles = ["True density n", "Reconstructed n", "True potential phi", "Reconstructed phi"]
-            for col, (img, title) in enumerate(zip(panels, titles)):
-                im = axs[row, col].imshow(img, origin="lower", cmap="RdBu_r")
-                axs[row, col].set_title(f"{title}\nC={c_val:.3g}")
+        for row, label in enumerate(FIELD_LABELS):
+            vmin, vmax = robust_symmetric_limits(true_np[row], recon_np[row])
+            evmin, evmax = robust_symmetric_limits(err_np[row])
+            panels = [true_np[row], recon_np[row], err_np[row]]
+            titles = [fr"Simulation {label}", fr"Reconstruction {label}", fr"Error {label}"]
+            limits = [(vmin, vmax), (vmin, vmax), (evmin, evmax)]
+            for col, (img, title, (lo, hi)) in enumerate(zip(panels, titles, limits)):
+                im = axs[row, col].imshow(img, origin="lower", cmap="RdBu_r", vmin=lo, vmax=hi)
+                axs[row, col].set_title(title)
+                axs[row, col].set_xticks([])
+                axs[row, col].set_yticks([])
                 plt.colorbar(im, ax=axs[row, col], fraction=0.046)
-    plt.suptitle("Conditional VAE Reconstruction Examples", fontweight="bold")
+    plt.suptitle(fr"Conditional VAE reconstruction for held-out $C={c_val:.3g}$", fontweight="bold")
     plt.tight_layout()
     plt.savefig(RECON_FIG, dpi=200)
     print(f"[Success] Saved '{RECON_FIG}'.")
@@ -341,7 +364,7 @@ def plot_reconstructions(model, dataset, device, indices=None, n_examples=3):
 # How it works:
 #   Draws random latent vectors z and decodes them together with log10(C), so
 #   multiple statistically plausible samples can be generated for the same C.
-def plot_generated_samples(model, dataset, device, c_values=None, samples_per_c=2):
+def plot_generated_samples(model, dataset, device, c_values=None, actual_indices=None, samples_per_c=1):
     model.eval()
     if c_values is None:
         c_values = dataset.unique_c_values()
@@ -349,27 +372,54 @@ def plot_generated_samples(model, dataset, device, c_values=None, samples_per_c=
     if len(c_values) > 3:
         c_values = np.array([c_values[0], c_values[len(c_values)//2], c_values[-1]])
 
-    fig, axs = plt.subplots(len(c_values), samples_per_c * 2, figsize=(4 * samples_per_c * 2, 3.5 * len(c_values)))
-    if len(c_values) == 1:
-        axs = axs[None, :]
+    samples_per_c = 1
+    if actual_indices is None:
+        actual_indices = np.arange(len(dataset), dtype=int)
+    else:
+        actual_indices = np.array(actual_indices, dtype=int)
 
     with torch.no_grad():
-        for row, c_val in enumerate(c_values):
+        saved_paths = []
+        for c_val in c_values:
+            matching_indices = actual_indices[np.isclose(dataset.raw_c_values[actual_indices], c_val, rtol=0.0, atol=1e-6)]
+            if len(matching_indices) == 0:
+                nearest_local_idx = np.argmin(np.abs(np.log10(dataset.raw_c_values[actual_indices]) - np.log10(c_val)))
+                actual_idx = int(actual_indices[nearest_local_idx])
+            else:
+                actual_idx = int(matching_indices[len(matching_indices) // 2])
+
             c_log = torch.full((samples_per_c, 1), np.log10(c_val), dtype=torch.float32, device=device)
             z = torch.randn(samples_per_c, LATENT_DIM, device=device)
             gen = model.decode(z, c_log)
-            gen_np = dataset.denormalize(gen)
-            for j in range(samples_per_c):
-                im0 = axs[row, 2*j].imshow(gen_np[j, 0], origin="lower", cmap="RdBu_r")
-                axs[row, 2*j].set_title(f"Generated n\nC={c_val:.3g}")
-                plt.colorbar(im0, ax=axs[row, 2*j], fraction=0.046)
-                im1 = axs[row, 2*j+1].imshow(gen_np[j, 1], origin="lower", cmap="RdBu_r")
-                axs[row, 2*j+1].set_title(f"Generated phi\nC={c_val:.3g}")
-                plt.colorbar(im1, ax=axs[row, 2*j+1], fraction=0.046)
-    plt.suptitle("Conditional VAE Generated Plasma Snapshots", fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(GEN_FIG, dpi=200)
-    print(f"[Success] Saved '{GEN_FIG}'.")
+            gen_np = dataset.denormalize(gen)[0]
+
+            actual_x, _ = dataset[actual_idx]
+            actual_np = dataset.denormalize(actual_x.unsqueeze(0))[0]
+
+            fig, axs = plt.subplots(2, N_FIELDS, figsize=(4 * N_FIELDS, 6.4))
+
+            for ch, label in enumerate(FIELD_LABELS):
+                vmin, vmax = robust_symmetric_limits(gen_np[ch], actual_np[ch])
+                panels = [
+                    (0, gen_np[ch], fr"Generated {label}: $C={c_val:.3g}$"),
+                    (1, actual_np[ch], fr"Actual {label}: $C={c_val:.3g}$"),
+                ]
+                for row, img, title in panels:
+                    im = axs[row, ch].imshow(img, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
+                    axs[row, ch].set_title(title)
+                    axs[row, ch].set_xticks([])
+                    axs[row, ch].set_yticks([])
+                    plt.colorbar(im, ax=axs[row, ch], fraction=0.046)
+
+            fig.suptitle(fr"Conditional VAE holdout comparison: generated vs actual at $C={c_val:.3g}$", fontweight="bold")
+            fig.tight_layout()
+            c_tag = f"{float(c_val):.4g}".replace(".", "p").replace("-", "m")
+            output_path = GEN_FIG.replace(".png", f"_C_{c_tag}.png")
+            fig.savefig(output_path, dpi=200)
+            plt.close(fig)
+            saved_paths.append(output_path)
+
+    print(f"[Success] Saved generated-vs-actual holdout comparisons: {', '.join(saved_paths)}")
 
 
 # Purpose:
@@ -474,34 +524,53 @@ def train():
 
     model = ConditionalVAE(image_size=image_size, latent_dim=LATENT_DIM).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    history = {"loss": [], "recon": [], "kl": []}
+    history = {"train_loss": [], "train_recon": [], "val_recon": [], "weighted_kl": []}
 
     for epoch in range(1, EPOCHS + 1):
+        beta = BETA_KL * min(1.0, epoch / KL_WARMUP_EPOCHS)
         model.train()
         totals = np.zeros(3, dtype=np.float64)
         n_batches = 0
         for x, c in train_loader:
             x, c = x.to(device), c.to(device)
             recon, mu, logvar = model(x, c)
-            loss, recon_loss, kl_loss = vae_loss(recon, x, mu, logvar)
+            loss, recon_loss, kl_loss = vae_loss(recon, x, mu, logvar, beta=beta)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             totals += np.array([loss.item(), recon_loss.item(), kl_loss.item()])
             n_batches += 1
         means = totals / max(n_batches, 1)
-        history["loss"].append(means[0])
-        history["recon"].append(means[1])
-        history["kl"].append(means[2])
+        model.eval()
+        val_total = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for x, c in val_loader:
+                x, c = x.to(device), c.to(device)
+                recon, _, _ = model(x, c)
+                val_total += F.mse_loss(recon, x, reduction="mean").item()
+                val_batches += 1
+        val_recon = val_total / max(val_batches, 1)
+
+        history["train_loss"].append(means[0])
+        history["train_recon"].append(means[1])
+        history["val_recon"].append(val_recon)
+        history["weighted_kl"].append(beta * means[2])
 
         if epoch == 1 or epoch % 10 == 0 or epoch == EPOCHS:
-            print(f"Epoch {epoch:04d}/{EPOCHS} | loss={means[0]:.4e} | recon={means[1]:.4e} | KL={means[2]:.4e}")
+            print(
+                f"Epoch {epoch:04d}/{EPOCHS} | beta={beta:.2e} | "
+                f"loss={means[0]:.4e} | train recon={means[1]:.4e} | "
+                f"val recon={val_recon:.4e} | weighted KL={beta * means[2]:.4e}"
+            )
 
     torch.save({
         "model_state_dict": model.state_dict(),
         "channel_mean": dataset.channel_mean,
         "channel_std": dataset.channel_std,
         "latent_dim": LATENT_DIM,
+        "n_fields": N_FIELDS,
+        "field_names": FIELD_NAMES,
         "image_shape": dataset.image_shape,
         "downsample_to": DOWNSAMPLE_TO,
         "preferred_heldout_c_values": PREFERRED_HELDOUT_C_VALUES,
@@ -511,7 +580,7 @@ def train():
 
     plot_loss_curve(history)
     plot_reconstructions(model, dataset, device, indices=val_indices)
-    plot_generated_samples(model, dataset, device, c_values=resolved_heldout_c_values)
+    plot_generated_samples(model, dataset, device, c_values=resolved_heldout_c_values, actual_indices=val_indices)
 
 
 if __name__ == "__main__":

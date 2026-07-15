@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from plasma_saturation import detect_saturation_window
 
 # -----------------------------------------------------------------------------
-# Step 4 Training: 2D Statistical Map Regression vs C
+# Step 3 Training: 2D Statistical Map Regression vs C
 # -----------------------------------------------------------------------------
 # TARGET_TYPE options:
 #   "rms"      : train RMS map only
@@ -135,7 +135,7 @@ class Step4MapDataset(Dataset):
         self._process_files()
 
     def _process_files(self):
-        print(f"Extracting Step 4 target='{self.target_type}' maps...")
+        print(f"Extracting Step 3 target='{self.target_type}' maps...")
         for file_name in self.file_list:
             with h5py.File(os.path.join(self.data_dir, file_name), "r") as f:
                 maps = extract_step4_maps(f)
@@ -346,7 +346,7 @@ def train_one_family(target_type, device):
         )
     df = run_loocv(dataset, device)
     print("\n" + "=" * 82)
-    print(f"STEP 4 REPORT — TARGET: {target_type}".center(82))
+    print(f"STEP 3 REPORT — TARGET: {target_type}".center(82))
     print("=" * 82)
     for _, row in df.iterrows():
         print(f"C={row['C_Value']:<10.4g} | NN={row['NN_DEX']:<8.4f} dex | baseline={row['Base_DEX']:<8.4f} dex")
