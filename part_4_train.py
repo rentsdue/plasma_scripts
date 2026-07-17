@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader, Subset, WeightedRandomSampler
 import matplotlib.pyplot as plt
 from plasma_saturation import detect_saturation_window
 
@@ -86,9 +86,12 @@ def infer_real_shape(uk_dataset):
 #   saturated training window.
 def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
     series = []
+    ky_weights = np.ones(uk.shape[-1], dtype=np.float64)
+    if uk.shape[-1] > 2:
+        ky_weights[1:-1] = 2.0
     for t in range(uk.shape[0]):
         phi_k = uk[t, 0, :, :]
-        e_mode = 0.5 * (kx2d**2 + ky2d**2) * np.abs(phi_k)**2
+        e_mode = 0.5 * (kx2d**2 + ky2d**2) * np.abs(phi_k)**2 * ky_weights[None, :]
         series.append(np.sum(e_mode))
     return np.array(series, dtype=np.float64)
 
@@ -108,16 +111,79 @@ def downsample_image_np(image, size):
     return x.squeeze(0).numpy().astype(np.float32)
 
 
+def truncate_rfft2_array(arr, out_nx, out_ny):
+    """Low-pass truncate a real-FFT-layout array to an [out_nx, out_ny//2+1] spectrum."""
+    out_nyh = out_ny // 2 + 1
+    out = np.zeros((out_nx, out_nyh), dtype=arr.dtype)
+    pos_rows = out_nx // 2 + 1
+    neg_rows = out_nx - pos_rows
+    cols = min(out_nyh, arr.shape[1])
+    out[:pos_rows, :cols] = arr[:pos_rows, :cols]
+    if neg_rows > 0:
+        out[-neg_rows:, :cols] = arr[-neg_rows:, :cols]
+    return out
+
+
+def reconstruct_fields_from_fourier(phi_k, n_k, kx2d, ky2d, real_shape):
+    """Reconstruct [n, phi, omega] from Fourier data at the requested real-space shape."""
+    nx, ny = real_shape
+    omega_k = -(kx2d**2 + ky2d**2) * phi_k
+    phi = np.fft.irfft2(phi_k, s=(nx, ny), norm="forward")
+    phi = phi - np.mean(phi)  # Remove gauge-dependent spatially constant potential offset.
+    density = np.fft.irfft2(n_k, s=(nx, ny), norm="forward")
+    omega = np.fft.irfft2(omega_k, s=(nx, ny), norm="forward")
+    return np.stack([density, phi, omega], axis=0).astype(np.float32)
+
+
+def reconstruct_model_resolution_fields(phi_k, n_k, kx2d, ky2d, native_shape, target_size):
+    """Use Fourier truncation, not real-space interpolation, to set model resolution."""
+    if target_size is None:
+        return reconstruct_fields_from_fourier(phi_k, n_k, kx2d, ky2d, native_shape)
+
+    phi_k_trunc = truncate_rfft2_array(phi_k, target_size, target_size)
+    n_k_trunc = truncate_rfft2_array(n_k, target_size, target_size)
+    kx_trunc = truncate_rfft2_array(kx2d, target_size, target_size)
+    ky_trunc = truncate_rfft2_array(ky2d, target_size, target_size)
+    return reconstruct_fields_from_fourier(
+        phi_k_trunc,
+        n_k_trunc,
+        kx_trunc,
+        ky_trunc,
+        (target_size, target_size),
+    )
+
+
 # Purpose:
-#   Build the Step 4 dataset of saturated real-space plasma snapshots.
+#   Build a Gaussian baseline with the same per-channel Fourier amplitudes as a
+#   real snapshot.
+# How it works:
+#   Randomizes phases using the FFT of real white noise, preserving Hermitian
+#   symmetry, then transforms back to real space and restores the channel mean.
+def spectrum_matched_gaussian_baseline(image, rng):
+    baseline = np.zeros_like(image, dtype=np.float32)
+    for ch in range(image.shape[0]):
+        field = image[ch].astype(np.float64)
+        field_mean = np.mean(field)
+        centered = field - field_mean
+        target_amp = np.abs(np.fft.fft2(centered, norm="forward"))
+        noise = rng.normal(size=centered.shape)
+        noise_phase = np.exp(1j * np.angle(np.fft.fft2(noise, norm="forward")))
+        gaussian = np.fft.ifft2(target_amp * noise_phase, norm="forward").real + field_mean
+        baseline[ch] = gaussian.astype(np.float32)
+    return baseline
+
+
+# Purpose:
+#   Build the Step 4 residual-correction dataset.
 # How it works:
 #   For each C-run, it detects the saturated window, transforms density and
 #   potential from Fourier space to real space, optionally downsamples, and
-#   stores [density, potential, vorticity] images conditioned on log10(C).
+#   stores actual fields, spectrum-matched Gaussian baselines, and residuals
+#   conditioned on log10(C).
 # Architecture role:
-#   Provides samples from p([n, phi, omega] | C) for the conditional VAE.
+#   Provides samples of Δx = x_actual - x_Gaussian for the conditional VAE.
 class SaturatedSnapshotDataset(Dataset):
-    """Dataset of saturated real-space snapshots [density, potential, vorticity] conditioned on log10(C)."""
+    """Dataset of residuals beyond a spectrum-matched Gaussian baseline."""
 
     def __init__(self, data_dir, downsample_to=DOWNSAMPLE_TO, max_snapshots_per_c=MAX_SNAPSHOTS_PER_C):
         self.data_dir = data_dir
@@ -128,8 +194,11 @@ class SaturatedSnapshotDataset(Dataset):
             if f.endswith(".h5") and f.startswith("hwak_C")
         )
 
-        self.conditions = []  # log10(C)
-        self.images = []      # [3, H, W], channels = [density, potential, vorticity]
+        self.conditions = []      # log10(C)
+        self.actual_images = []   # x_actual: [3, H, W]
+        self.baselines = []       # x_Gaussian: [3, H, W]
+        self.residuals = []       # Δx = x_actual - x_Gaussian
+        self.residual_scales = [] # per-sample/channel Gaussian RMS used to scale Δx
         self.raw_c_values = []
         self.image_shape = None
         self.channel_mean = None
@@ -138,7 +207,8 @@ class SaturatedSnapshotDataset(Dataset):
         self._process_files()
 
     def _process_files(self):
-        print("Extracting saturated [n, φ, ω] snapshots for conditional VAE...")
+        print("Extracting saturated [n, φ, ω] residuals relative to Gaussian baselines...")
+        rng = np.random.default_rng(SEED)
 
         for file_name in self.file_list:
             file_path = os.path.join(self.data_dir, file_name)
@@ -163,60 +233,67 @@ class SaturatedSnapshotDataset(Dataset):
                 for t in all_indices:
                     phi_k = uk[t, 0, :, :]
                     n_k = f["fields/nk"][t, 0, :, :] if "fields/nk" in f else uk[t, 1, :, :]
-                    omega_k = -(kx2d**2 + ky2d**2) * phi_k
-
-                    phi = np.fft.irfft2(phi_k, s=(nx, ny), norm="forward")
-                    density = np.fft.irfft2(n_k, s=(nx, ny), norm="forward")
-                    omega = np.fft.irfft2(omega_k, s=(nx, ny), norm="forward")
-
-                    image = np.stack([density, phi, omega], axis=0)
-                    image = downsample_image_np(image, self.downsample_to)
+                    image = reconstruct_model_resolution_fields(
+                        phi_k,
+                        n_k,
+                        kx2d,
+                        ky2d,
+                        native_shape=(nx, ny),
+                        target_size=self.downsample_to,
+                    )
+                    baseline = spectrum_matched_gaussian_baseline(image, rng)
+                    residual = image - baseline
+                    residual_scale = np.sqrt(np.mean(baseline**2, axis=(1, 2), keepdims=True)).astype(np.float32) + 1e-8
+                    scaled_residual = residual / residual_scale
 
                     self.conditions.append([log_c])
-                    self.images.append(image)
+                    self.actual_images.append(image)
+                    self.baselines.append(baseline)
+                    self.residuals.append(scaled_residual)
+                    self.residual_scales.append(residual_scale)
                     self.raw_c_values.append(c_val)
 
         self.conditions = np.array(self.conditions, dtype=np.float32)
-        self.images = np.array(self.images, dtype=np.float32)
+        self.actual_images = np.array(self.actual_images, dtype=np.float32)
+        self.baselines = np.array(self.baselines, dtype=np.float32)
+        self.residuals = np.array(self.residuals, dtype=np.float32)
+        self.residual_scales = np.array(self.residual_scales, dtype=np.float32)
         self.raw_c_values = np.array(self.raw_c_values, dtype=np.float32)
-        self.image_shape = self.images.shape[-2:]
-        print(f"Loaded {len(self.images)} snapshots with image shape {self.images.shape[1:]}")
+        self.image_shape = self.actual_images.shape[-2:]
+        print(f"Loaded {len(self.actual_images)} residual samples with image shape {self.actual_images.shape[1:]}")
 
     def recompute_normalization_from_indices(self, indices):
-        """Normalize all images using training indices only to avoid validation leakage."""
-        train_images = self.images[np.array(indices, dtype=int)]
-        self.channel_mean = train_images.mean(axis=(0, 2, 3), keepdims=True).astype(np.float32)
-        self.channel_std = (train_images.std(axis=(0, 2, 3), keepdims=True) + 1e-8).astype(np.float32)
-        self.images = (self.images - self.channel_mean) / self.channel_std
-        print("Channel normalization fitted on training C values only:")
-        for idx, label in enumerate(["n", "φ", "ω"]):
-            print(f"  {label:<7} mean/std = {self.channel_mean.ravel()[idx]:.4e} / {self.channel_std.ravel()[idx]:.4e}")
+        """Residuals are sample-wise scaled by Gaussian RMS; no global C-mixing normalization."""
+        self.channel_mean = np.zeros((1, N_FIELDS, 1, 1), dtype=np.float32)
+        self.channel_std = np.ones((1, N_FIELDS, 1, 1), dtype=np.float32)
+        print("Residuals scaled sample-wise by Gaussian baseline RMS; no global per-channel normalization applied.")
 
-    def denormalize(self, x):
-        """Denormalize torch or numpy tensor with shape [..., N_FIELDS, H, W]. Returns numpy."""
+    def denormalize_residual(self, x):
+        """Return dimensionless residual tensor with shape [..., N_FIELDS, H, W]."""
         if isinstance(x, torch.Tensor):
             x = x.detach().cpu().numpy()
-        mean = self.channel_mean.reshape(1, N_FIELDS, 1, 1)
-        std = self.channel_std.reshape(1, N_FIELDS, 1, 1)
-        return x * std + mean
+        return x
+
+    def denormalize(self, x):
+        """Backward-compatible alias for residual denormalization."""
+        return self.denormalize_residual(x)
 
     def unique_c_values(self):
         return np.unique(self.raw_c_values)
 
     def __len__(self):
-        return len(self.images)
+        return len(self.residuals)
 
     def __getitem__(self, idx):
-        return torch.tensor(self.images[idx]), torch.tensor(self.conditions[idx])
+        return torch.tensor(self.residuals[idx]), torch.tensor(self.conditions[idx])
 
 
 # Purpose:
-#   Conditional variational autoencoder for saturated plasma snapshots.
+#   Conditional variational autoencoder for non-Gaussian residuals.
 # How it works:
-#   The encoder receives [density, potential, vorticity, log10(C)-channel] and maps each
-#   image to a Gaussian latent distribution. The decoder receives a random
-#   latent vector z plus log10(C), then generates a plausible [density, phi, omega]
-#   snapshot for that condition.
+#   The encoder receives residual fields plus a log10(C)-channel. The decoder
+#   receives a random latent vector z plus log10(C), then generates a residual
+#   correction to add constructively to a spectrum-matched Gaussian baseline.
 class ConditionalVAE(nn.Module):
     def __init__(self, image_size=128, latent_dim=LATENT_DIM):
         super().__init__()
@@ -291,6 +368,24 @@ def robust_symmetric_limits(*arrays, percentile=99.0):
     return -limit, limit
 
 
+def imshow_xy(ax, img, **kwargs):
+    """Display stored (x, y) fields with x horizontal and y vertical."""
+    return ax.imshow(np.asarray(img).T, origin="lower", **kwargs)
+
+
+def make_balanced_c_sampler(dataset, indices):
+    """Return a sampler that gives each C value equal expected training weight."""
+    subset_c = dataset.raw_c_values[np.array(indices, dtype=int)]
+    unique_c, counts = np.unique(subset_c, return_counts=True)
+    count_by_c = {float(c): int(count) for c, count in zip(unique_c, counts)}
+    weights = np.array([1.0 / count_by_c[float(c)] for c in subset_c], dtype=np.float64)
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(indices),
+        replacement=True,
+    )
+
+
 # Purpose:
 #   Visualize VAE training progress.
 # How it works:
@@ -298,8 +393,8 @@ def robust_symmetric_limits(*arrays, percentile=99.0):
 def plot_loss_curve(history):
     plt.figure(figsize=(8, 5))
     plt.plot(history["train_loss"], label="train total loss")
-    plt.plot(history["train_recon"], label="train reconstruction")
-    plt.plot(history["val_recon"], label="held-out C reconstruction")
+    plt.plot(history["train_recon"], label="train residual reconstruction")
+    plt.plot(history["val_recon"], label="held-out C residual reconstruction")
     plt.plot(history["weighted_kl"], label=r"weighted KL, $\beta D_{KL}$")
     plt.yscale("log")
     plt.xlabel("Epoch")
@@ -313,10 +408,10 @@ def plot_loss_curve(history):
 
 
 # Purpose:
-#   Show reconstruction examples from the validation/held-out set.
+#   Show residual-correction examples from the validation/held-out set.
 # How it works:
-#   Passes selected true snapshots through the encoder-decoder and plots true
-#   vs reconstructed density/potential fields.
+#   Passes selected residuals through the encoder-decoder, adds the predicted
+#   residual to the Gaussian baseline, and compares against the actual field.
 def plot_reconstructions(model, dataset, device, indices=None, n_examples=3):
     model.eval()
     if indices is None:
@@ -326,7 +421,8 @@ def plot_reconstructions(model, dataset, device, indices=None, n_examples=3):
         indices = np.array(indices, dtype=int)
         n_examples = min(n_examples, len(indices))
         indices = indices[np.linspace(0, len(indices) - 1, n_examples, dtype=int)]
-    fig, axs = plt.subplots(N_FIELDS, 3, figsize=(10.5, 9.0))
+    n_panels = 5
+    fig, axs = plt.subplots(N_FIELDS, n_panels, figsize=(4.0 * n_panels, 9.0))
     if N_FIELDS == 1:
         axs = axs[None, :]
 
@@ -336,24 +432,33 @@ def plot_reconstructions(model, dataset, device, indices=None, n_examples=3):
         x_b = x.unsqueeze(0).to(device)
         c_b = c.unsqueeze(0).to(device)
         recon, _, _ = model(x_b, c_b)
-        true_np = dataset.denormalize(x_b)[0]
-        recon_np = dataset.denormalize(recon)[0]
-        err_np = recon_np - true_np
+        true_residual_np = dataset.denormalize_residual(x_b)[0]
+        pred_residual_np = dataset.denormalize_residual(recon)[0]
+        baseline_np = dataset.baselines[idx]
+        residual_scale_np = dataset.residual_scales[idx]
+        actual_np = dataset.actual_images[idx]
+        true_residual_physical_np = true_residual_np * residual_scale_np
+        pred_residual_physical_np = pred_residual_np * residual_scale_np
+        corrected_np = baseline_np + pred_residual_physical_np
+        err_np = corrected_np - actual_np
         c_val = 10 ** float(c.item())
 
         for row, label in enumerate(FIELD_LABELS):
-            vmin, vmax = robust_symmetric_limits(true_np[row], recon_np[row])
+            vmin, vmax = robust_symmetric_limits(baseline_np[row], corrected_np[row], actual_np[row])
             evmin, evmax = robust_symmetric_limits(err_np[row])
-            panels = [true_np[row], recon_np[row], err_np[row]]
-            titles = [fr"Simulation {label}", fr"Reconstruction {label}", fr"Error {label}"]
-            limits = [(vmin, vmax), (vmin, vmax), (evmin, evmax)]
+            rvmin, rvmax = robust_symmetric_limits(true_residual_physical_np[row], pred_residual_physical_np[row])
+            panels = [baseline_np[row], pred_residual_physical_np[row], corrected_np[row], actual_np[row], err_np[row]]
+            titles = [fr"Gaussian {label}", fr"VAE correction {label}", fr"Corrected {label}", fr"Actual {label}", fr"Error {label}"]
+            limits = [(vmin, vmax), (rvmin, rvmax), (vmin, vmax), (vmin, vmax), (evmin, evmax)]
+            if axs.shape[1] != len(panels):
+                raise RuntimeError("plot_reconstructions axes do not match requested panel count.")
             for col, (img, title, (lo, hi)) in enumerate(zip(panels, titles, limits)):
-                im = axs[row, col].imshow(img, origin="lower", cmap="RdBu_r", vmin=lo, vmax=hi)
+                im = imshow_xy(axs[row, col], img, cmap="RdBu_r", vmin=lo, vmax=hi)
                 axs[row, col].set_title(title)
-                axs[row, col].set_xticks([])
-                axs[row, col].set_yticks([])
+                axs[row, col].set_xlabel("x index")
+                axs[row, col].set_ylabel("y index")
                 plt.colorbar(im, ax=axs[row, col], fraction=0.046)
-    plt.suptitle(fr"Conditional VAE reconstruction for held-out $C={c_val:.3g}$", fontweight="bold")
+    plt.suptitle(fr"Residual VAE correction for held-out $C={c_val:.3g}$", fontweight="bold")
     plt.tight_layout()
     plt.savefig(RECON_FIG, dpi=200)
     print(f"[Success] Saved '{RECON_FIG}'.")
@@ -391,27 +496,33 @@ def plot_generated_samples(model, dataset, device, c_values=None, actual_indices
             c_log = torch.full((samples_per_c, 1), np.log10(c_val), dtype=torch.float32, device=device)
             z = torch.randn(samples_per_c, LATENT_DIM, device=device)
             gen = model.decode(z, c_log)
-            gen_np = dataset.denormalize(gen)[0]
+            pred_residual_np = dataset.denormalize_residual(gen)[0]
 
-            actual_x, _ = dataset[actual_idx]
-            actual_np = dataset.denormalize(actual_x.unsqueeze(0))[0]
+            baseline_np = dataset.baselines[actual_idx]
+            residual_scale_np = dataset.residual_scales[actual_idx]
+            actual_np = dataset.actual_images[actual_idx]
+            pred_residual_physical_np = pred_residual_np * residual_scale_np
+            corrected_np = baseline_np + pred_residual_physical_np
 
-            fig, axs = plt.subplots(2, N_FIELDS, figsize=(4 * N_FIELDS, 6.4))
+            fig, axs = plt.subplots(4, N_FIELDS, figsize=(4 * N_FIELDS, 12.0))
 
             for ch, label in enumerate(FIELD_LABELS):
-                vmin, vmax = robust_symmetric_limits(gen_np[ch], actual_np[ch])
+                vmin, vmax = robust_symmetric_limits(baseline_np[ch], corrected_np[ch], actual_np[ch])
+                rvmin, rvmax = robust_symmetric_limits(pred_residual_physical_np[ch])
                 panels = [
-                    (0, gen_np[ch], fr"Generated {label}: $C={c_val:.3g}$"),
-                    (1, actual_np[ch], fr"Actual {label}: $C={c_val:.3g}$"),
+                    (0, baseline_np[ch], fr"Gaussian {label}: $C={c_val:.3g}$", vmin, vmax),
+                    (1, pred_residual_physical_np[ch], fr"VAE correction {label}: $C={c_val:.3g}$", rvmin, rvmax),
+                    (2, corrected_np[ch], fr"Corrected {label}: $C={c_val:.3g}$", vmin, vmax),
+                    (3, actual_np[ch], fr"Actual {label}: $C={c_val:.3g}$", vmin, vmax),
                 ]
-                for row, img, title in panels:
-                    im = axs[row, ch].imshow(img, origin="lower", cmap="RdBu_r", vmin=vmin, vmax=vmax)
+                for row, img, title, lo, hi in panels:
+                    im = imshow_xy(axs[row, ch], img, cmap="RdBu_r", vmin=lo, vmax=hi)
                     axs[row, ch].set_title(title)
-                    axs[row, ch].set_xticks([])
-                    axs[row, ch].set_yticks([])
+                    axs[row, ch].set_xlabel("x index")
+                    axs[row, ch].set_ylabel("y index")
                     plt.colorbar(im, ax=axs[row, ch], fraction=0.046)
 
-            fig.suptitle(fr"Conditional VAE holdout comparison: generated vs actual at $C={c_val:.3g}$", fontweight="bold")
+            fig.suptitle(fr"Gaussian baseline + VAE residual correction at $C={c_val:.3g}$", fontweight="bold")
             fig.tight_layout()
             c_tag = f"{float(c_val):.4g}".replace(".", "p").replace("-", "m")
             output_path = GEN_FIG.replace(".png", f"_C_{c_tag}.png")
@@ -519,7 +630,8 @@ def train():
     print_split_summary(dataset, train_indices, val_indices)
     train_ds = Subset(dataset, train_indices)
     val_ds = Subset(dataset, val_indices)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    train_sampler = make_balanced_c_sampler(dataset, train_indices)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=train_sampler, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     model = ConditionalVAE(image_size=image_size, latent_dim=LATENT_DIM).to(device)

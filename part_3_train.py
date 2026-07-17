@@ -80,7 +80,6 @@ def compute_total_kinetic_energy_series(uk, kx2d, ky2d):
 #   Averages RMS potential, flux, and spectral power over the saturated window.
 def extract_step4_maps(h5_file):
     c_val = h5_file["params/C"][()]
-    kappa = h5_file["params/kappa"][()] if "params/kappa" in h5_file else 1.0
     uk = h5_file["fields/uk"]
     kx2d = h5_file["data/kx"][()]
     ky2d = h5_file["data/ky"][()]
@@ -104,17 +103,20 @@ def extract_step4_maps(h5_file):
         density = np.fft.irfft2(n_k, s=(nx, ny), norm="forward")
         grady_phi = np.fft.irfft2(grady_phi_k, s=(nx, ny), norm="forward")
         phi_sq_accum += phi**2
-        flux_accum += -kappa * density * grady_phi
+        flux_accum += -density * grady_phi
         spectrum_accum += np.abs(np.fft.fft2(phi, norm="forward")) ** 2
 
     rms_map = np.sqrt(phi_sq_accum / n_t)
     flux_map = flux_accum / n_t
     spectrum_map = spectrum_accum / n_t
+    flux_scale = 1e-2 * np.median(np.abs(flux_map))  # robust per-run scale for signed flux
+    if not np.isfinite(flux_scale) or flux_scale <= 0:
+        flux_scale = EPS
     return {
         "C": c_val,
         "shape": (nx, ny),
         "rms": np.log10(rms_map + EPS),
-        "flux": np.log10(np.abs(flux_map) + EPS),
+        "flux": np.arcsinh(flux_map / flux_scale),
         "spectrum": np.log10(spectrum_map + EPS),
     }
 
@@ -202,30 +204,64 @@ def informative_error(pred_flat, true_flat, dataset):
     return float(np.median(np.abs(pred_fold[:, :n_ky] - true_fold[:, :n_ky])))
 
 
+def error_unit(target_type):
+    return "dex" if target_type in {"rms", "spectrum"} else "transformed units"
+
+
+def robust_percentile_limits(*arrays, percentiles=(2, 98), fallback=(0.0, 1.0)):
+    values = np.concatenate([np.ravel(np.asarray(arr)) for arr in arrays])
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return fallback
+    vmin, vmax = np.nanpercentile(values, percentiles)
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        center = float(np.nanmedian(values)) if values.size else 0.0
+        spread = float(np.nanstd(values)) if values.size else 0.0
+        if not np.isfinite(spread) or spread <= 0:
+            spread = 1.0
+        return center - spread, center + spread
+    return float(vmin), float(vmax)
+
+
+def map_for_display(dataset, flat):
+    img = dataset.unflatten(flat)
+    if dataset.target_type == "spectrum":
+        return fold_kx_log_spectrum(img, LOW_KX_MODES)[:, :LOW_KY_MODES]
+    return img
+
+
+def select_hydrodynamic_row(df, max_c=1e-2, preferred_c=0.008975):
+    hydro = df[df["C_Value"] < max_c]
+    candidates = hydro if len(hydro) else df
+    idx = (np.log10(candidates["C_Value"].astype(float)) - np.log10(preferred_c)).abs().idxmin()
+    return candidates.loc[idx]
+
+
 # Purpose:
 #   Show one held-out Step 3 prediction beside its simulation target.
 # How it works:
 #   Plots true map, POD-FFNN map, and absolute error map for a representative C.
 def plot_validation_panel(dataset, row, output_name):
-    true_map = dataset.unflatten(row["True_Target"])
-    pred_map = dataset.unflatten(row["NN_Target"])
+    true_map = map_for_display(dataset, row["True_Target"])
+    pred_map = map_for_display(dataset, row["NN_Target"])
     if dataset.target_type == "spectrum":
-        true_map = fold_kx_log_spectrum(true_map, LOW_KX_MODES)[:, :LOW_KY_MODES]
-        pred_map = fold_kx_log_spectrum(pred_map, LOW_KX_MODES)[:, :LOW_KY_MODES]
         title = r"Folded low-mode spectrum $P_\phi(|k_x|,k_y)$"
-        xlabel, ylabel = r"$k_y$ mode", r"$|k_x|$ mode"
+        xlabel, ylabel = r"$|k_x|$ mode", r"$k_y$ mode"
     else:
         title = f"{dataset.target_type} spatial map"
-        xlabel, ylabel = "y index", "x index"
+        xlabel, ylabel = "x coordinate", "y coordinate"
     error_map = np.abs(pred_map - true_map)
-    vmin, vmax = np.nanpercentile(true_map, [2, 98])
+    vmin, vmax = robust_percentile_limits(true_map, pred_map)
     fig, axs = plt.subplots(1, 3, figsize=(14, 4.5))
     for ax, img, ttl, cmap in [
         (axs[0], true_map, "Simulation", "inferno"),
         (axs[1], pred_map, "ML prediction", "inferno"),
-        (axs[2], error_map, "Prediction error [dex]", "viridis"),
+        (axs[2], error_map, f"Prediction error [{error_unit(dataset.target_type)}]", "viridis"),
     ]:
-        im = ax.imshow(img, origin="lower", cmap=cmap, vmin=vmin if cmap == "inferno" else None, vmax=vmax if cmap == "inferno" else None)
+        # Transpose because imshow places array columns on the x-axis and rows
+        # on the y-axis. The map arrays are stored as (x or kx, y or ky), so
+        # img.T displays x/kx horizontally and y/ky vertically.
+        im = ax.imshow(img.T, origin="lower", cmap=cmap, vmin=vmin if cmap == "inferno" else None, vmax=vmax if cmap == "inferno" else None)
         ax.set_title(ttl)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
@@ -252,7 +288,7 @@ def plot_spectrum_mode_sweep(dataset, df, output_name):
         true_profiles.append(np.mean(true_fold[:, :LOW_KY_MODES], axis=0))
         pred_profiles.append(np.mean(pred_fold[:, :LOW_KY_MODES], axis=0))
     true_profiles, pred_profiles = np.array(true_profiles), np.array(pred_profiles)
-    vmin, vmax = np.nanpercentile(true_profiles, [2, 98])
+    vmin, vmax = robust_percentile_limits(true_profiles, pred_profiles)
     fig, axs = plt.subplots(1, 3, figsize=(18, 5.2))
     im0 = axs[0].pcolormesh(modes, c_values, true_profiles, cmap="inferno", shading="auto", vmin=vmin, vmax=vmax)
     axs[0].set_yscale("log"); axs[0].set_title(r"Simulation: $\log_{10}P_\phi(k_y;C)$")
@@ -281,10 +317,12 @@ def plot_error_comparison(df, target_type, output_name):
     fig, ax = plt.subplots(figsize=(7.2, 4.6))
     ax.plot(c_values, df["NN_DEX"].values, marker="o", lw=2.2, label="POD-FFNN prediction")
     ax.plot(c_values, df["Base_DEX"].values, marker="s", lw=2.0, ls="--", label="Linear interpolation baseline")
+    if "Floor_DEX" in df:
+        ax.plot(c_values, df["Floor_DEX"].values, marker="^", lw=1.8, ls=":", label="POD reconstruction check")
     ax.set_xscale("log")
     ax.set_xlabel(r"Adiabaticity $C$")
-    ax.set_ylabel("Median absolute error [dex]")
-    ax.set_title(f"Step 3 {target_type} map error: ML vs interpolation")
+    ax.set_ylabel(f"Median absolute error [{error_unit(target_type)}]")
+    ax.set_title(f"Step 4 {target_type} map error: ML vs interpolation")
     ax.grid(True, which="both", alpha=0.3, linestyle=":")
     ax.legend(loc="best")
     fig.tight_layout()
@@ -325,12 +363,68 @@ def run_loocv(dataset, device):
             scaled_pred_coeffs = model(test_x).cpu().numpy().squeeze()
         pred_coeffs = scaled_pred_coeffs * coeff_std + coeff_mean
         nn_pred_y = pca.inverse_transform(pred_coeffs.reshape(1, -1)).squeeze()
+        floor_y = pca.inverse_transform(pca.transform(true_y.reshape(1, -1))).squeeze()
         nn_error = informative_error(nn_pred_y, true_y, dataset)
         base_error = informative_error(base_pred_y, true_y, dataset)
+        floor_error = informative_error(floor_y, true_y, dataset)
         results.append({"C_Value": test_c, "NN_DEX": nn_error, "Base_DEX": base_error,
-                        "True_Target": true_y, "NN_Target": nn_pred_y, "Base_Target": base_pred_y})
-        print(f" -> {dataset.target_type} C={test_c:.3e} | NN={nn_error:.4f} dex | baseline={base_error:.4f} dex")
+                        "Floor_DEX": floor_error, "True_Target": true_y, "NN_Target": nn_pred_y,
+                        "Base_Target": base_pred_y, "Floor_Target": floor_y})
+        unit = error_unit(dataset.target_type)
+        print(f" -> {dataset.target_type} C={test_c:.3e} | NN={nn_error:.4f} {unit} | baseline={base_error:.4f} {unit} | POD-recon={floor_error:.4f} {unit}")
     return pd.DataFrame(results).sort_values("C_Value")
+
+
+def plot_hydrodynamic_holdout_grid(results_by_target, output_name="step3_hydrodynamic_holdout_grid.png"):
+    target_order = [target for target in ["flux", "spectrum", "rms"] if target in results_by_target]
+    if not target_order:
+        return
+    n_rows, n_cols = len(target_order), 5
+    fig, axs = plt.subplots(n_rows, n_cols, figsize=(4.8 * n_cols, 4.2 * n_rows), squeeze=False)
+    col_titles = ["Simulation", "POD-FFNN", "POD reconstruction", "|NN − truth|", "|POD recon − truth|"]
+    for row_idx, target in enumerate(target_order):
+        dataset, df = results_by_target[target]
+        row = select_hydrodynamic_row(df)
+        true_map = map_for_display(dataset, row["True_Target"])
+        nn_map = map_for_display(dataset, row["NN_Target"])
+        floor_map = map_for_display(dataset, row["Floor_Target"])
+        nn_err_map = np.abs(nn_map - true_map)
+        floor_err_map = np.abs(floor_map - true_map)
+        field_vmin, field_vmax = robust_percentile_limits(true_map, nn_map, floor_map)
+        err_vmin, err_vmax = robust_percentile_limits(nn_err_map, floor_err_map, percentiles=(0, 98), fallback=(0.0, 1.0))
+        images = [true_map, nn_map, floor_map, nn_err_map, floor_err_map]
+        cmaps = ["inferno", "inferno", "inferno", "viridis", "viridis"]
+        titles = [
+            col_titles[0],
+            f"{col_titles[1]}\nerr {row['NN_DEX']:.3f}",
+            f"{col_titles[2]}\nerr {row['Floor_DEX']:.3f}",
+            col_titles[3],
+            col_titles[4],
+        ]
+        for col_idx, (img, cmap, title) in enumerate(zip(images, cmaps, titles)):
+            ax = axs[row_idx, col_idx]
+            is_error = col_idx >= 3
+            im = ax.imshow(
+                img.T,
+                origin="lower",
+                cmap=cmap,
+                vmin=err_vmin if is_error else field_vmin,
+                vmax=err_vmax if is_error else field_vmax,
+            )
+            ax.set_title(title, fontweight="bold" if col_idx in {1, 2} else None)
+            ax.set_xticks([]); ax.set_yticks([])
+            if col_idx == 0:
+                ax.set_ylabel(f"{target} @ C={row['C_Value']:.4g}\n[{error_unit(target)}]", fontweight="bold")
+            plt.colorbar(im, ax=ax, fraction=0.046)
+    fig.suptitle(
+        "Step 3 hydrodynamic holdout comparison (C << 1)\n"
+        "POD reconstruction is an L2 basis check; median-scored errors are not a strict floor.",
+        fontweight="bold",
+        fontsize=15,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(output_name, dpi=200)
+    print(f"[Success] Saved '{output_name}'.")
 
 
 # Purpose:
@@ -346,16 +440,17 @@ def train_one_family(target_type, device):
         )
     df = run_loocv(dataset, device)
     print("\n" + "=" * 82)
-    print(f"STEP 3 REPORT — TARGET: {target_type}".center(82))
+    print(f"STEP 4 REPORT — TARGET: {target_type}".center(82))
     print("=" * 82)
     for _, row in df.iterrows():
-        print(f"C={row['C_Value']:<10.4g} | NN={row['NN_DEX']:<8.4f} dex | baseline={row['Base_DEX']:<8.4f} dex")
-    sample_row = df.iloc[len(df) // 2]
+        unit = error_unit(target_type)
+        print(f"C={row['C_Value']:<10.4g} | NN={row['NN_DEX']:<8.4f} {unit} | baseline={row['Base_DEX']:<8.4f} {unit} | POD-recon={row['Floor_DEX']:<8.4f} {unit}")
+    sample_row = select_hydrodynamic_row(df)
     plot_error_comparison(df, target_type, f"step3_{target_type}_error_comparison.png")
     plot_validation_panel(dataset, sample_row, f"step3_{target_type}_2d_map_validation.png")
     if target_type == "spectrum":
         plot_spectrum_mode_sweep(dataset, df, "step3_spectrum_mode_space_sweep.png")
-    return df
+    return dataset, df
 
 
 if __name__ == "__main__":
@@ -365,3 +460,4 @@ if __name__ == "__main__":
     all_results = {}
     for target in target_list:
         all_results[target] = train_one_family(target, device)
+    plot_hydrodynamic_holdout_grid(all_results)
