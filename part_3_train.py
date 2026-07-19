@@ -37,6 +37,7 @@ LR = 0.01
 EPS = 1e-20
 LOW_KX_MODES = 40
 LOW_KY_MODES = 40
+PROGRESS_EVERY_EPOCHS = 200
 
 
 def seed_everything(seed=42):
@@ -137,8 +138,10 @@ class Step4MapDataset(Dataset):
         self._process_files()
 
     def _process_files(self):
-        print(f"Extracting Step 3 target='{self.target_type}' maps...")
-        for file_name in self.file_list:
+        n_files = len(self.file_list)
+        print(f"[{self.target_type}] Extracting Step 3 maps from {n_files} files...", flush=True)
+        for file_idx, file_name in enumerate(self.file_list, start=1):
+            print(f"[{self.target_type}] extraction {file_idx}/{n_files}: {file_name}", flush=True)
             with h5py.File(os.path.join(self.data_dir, file_name), "r") as f:
                 maps = extract_step4_maps(f)
             self.grid_shape = maps["shape"]
@@ -149,6 +152,7 @@ class Step4MapDataset(Dataset):
         self.raw_c_values = np.array(self.raw_c_values, dtype=np.float32)
         self.inputs = np.array(self.inputs, dtype=np.float32)
         self.targets = np.array(self.targets, dtype=np.float32)
+        print(f"[{self.target_type}] Finished extracting {n_files} maps.", flush=True)
 
     def unflatten(self, flat):
         return flat.reshape(self.grid_shape)
@@ -336,8 +340,14 @@ def plot_error_comparison(df, target_type, output_name):
 #   Fits POD on training C values, trains an FFNN on coefficients, and compares against interpolation.
 def run_loocv(dataset, device):
     results = []
-    for test_idx in range(len(dataset)):
+    n_cases = len(dataset)
+    print(f"[{dataset.target_type}] Starting LOOCV over {n_cases} held-out C values on {device}.", flush=True)
+    for test_idx in range(n_cases):
         test_c = dataset.raw_c_values[test_idx]
+        print(
+            f"[{dataset.target_type}] LOOCV {test_idx + 1}/{n_cases}: held-out C={test_c:.4g}",
+            flush=True,
+        )
         train_indices = [i for i in range(len(dataset)) if i != test_idx]
         train_y, true_y = dataset.targets[train_indices], dataset.targets[test_idx]
         n_modes = min(N_POD_MODES, len(train_indices), train_y.shape[1])
@@ -354,10 +364,15 @@ def run_loocv(dataset, device):
         optimizer = torch.optim.Adam(model.parameters(), lr=LR)
         criterion = nn.MSELoss()
         model.train()
-        for _ in range(EPOCHS):
+        for epoch in range(1, EPOCHS + 1):
             pred = model(train_x)
             loss = criterion(pred, train_target)
             optimizer.zero_grad(); loss.backward(); optimizer.step()
+            if epoch == 1 or epoch == EPOCHS or epoch % PROGRESS_EVERY_EPOCHS == 0:
+                print(
+                    f"[{dataset.target_type}] C={test_c:.4g} epoch {epoch}/{EPOCHS} loss={loss.item():.6e}",
+                    flush=True,
+                )
         model.eval()
         with torch.no_grad():
             scaled_pred_coeffs = model(test_x).cpu().numpy().squeeze()
@@ -371,7 +386,8 @@ def run_loocv(dataset, device):
                         "Floor_DEX": floor_error, "True_Target": true_y, "NN_Target": nn_pred_y,
                         "Base_Target": base_pred_y, "Floor_Target": floor_y})
         unit = error_unit(dataset.target_type)
-        print(f" -> {dataset.target_type} C={test_c:.3e} | NN={nn_error:.4f} {unit} | baseline={base_error:.4f} {unit} | POD-recon={floor_error:.4f} {unit}")
+        print(f" -> {dataset.target_type} C={test_c:.3e} | NN={nn_error:.4f} {unit} | baseline={base_error:.4f} {unit} | POD-recon={floor_error:.4f} {unit}", flush=True)
+    print(f"[{dataset.target_type}] Finished LOOCV.", flush=True)
     return pd.DataFrame(results).sort_values("C_Value")
 
 
@@ -380,9 +396,20 @@ def plot_hydrodynamic_holdout_grid(results_by_target, output_name="step3_hydrody
     if not target_order:
         return
     n_rows, n_cols = len(target_order), 5
-    fig, axs = plt.subplots(n_rows, n_cols, figsize=(4.8 * n_cols, 4.2 * n_rows), squeeze=False)
+    fig, axs = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.8 * n_cols, 4.2 * n_rows),
+        squeeze=False,
+        sharey="row",
+    )
+    title_fontsize = 16
+    label_fontsize = 15
+    tick_fontsize = 13
+    cbar_tick_fontsize = 13
     col_titles = ["Simulation", "POD-FFNN", "POD reconstruction", "|NN − truth|", "|POD recon − truth|"]
     for row_idx, target in enumerate(target_order):
+        print(f"[grid] rendering {target} row {row_idx + 1}/{len(target_order)}", flush=True)
         dataset, df = results_by_target[target]
         row = select_hydrodynamic_row(df)
         true_map = map_for_display(dataset, row["True_Target"])
@@ -396,8 +423,8 @@ def plot_hydrodynamic_holdout_grid(results_by_target, output_name="step3_hydrody
         cmaps = ["inferno", "inferno", "inferno", "viridis", "viridis"]
         titles = [
             col_titles[0],
-            f"{col_titles[1]}\nerr {row['NN_DEX']:.3f}",
-            f"{col_titles[2]}\nerr {row['Floor_DEX']:.3f}",
+            col_titles[1],
+            col_titles[2],
             col_titles[3],
             col_titles[4],
         ]
@@ -411,27 +438,41 @@ def plot_hydrodynamic_holdout_grid(results_by_target, output_name="step3_hydrody
                 vmin=err_vmin if is_error else field_vmin,
                 vmax=err_vmax if is_error else field_vmax,
             )
-            ax.set_title(title, fontweight="bold" if col_idx in {1, 2} else None)
-            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_title(title, fontsize=title_fontsize, fontweight="bold" if col_idx in {1, 2} else None)
             if col_idx == 0:
-                ax.set_ylabel(f"{target} @ C={row['C_Value']:.4g}\n[{error_unit(target)}]", fontweight="bold")
-            plt.colorbar(im, ax=ax, fraction=0.046)
-    fig.suptitle(
-        "Step 3 hydrodynamic holdout comparison (C << 1)\n"
-        "POD reconstruction is an L2 basis check; median-scored errors are not a strict floor.",
-        fontweight="bold",
-        fontsize=15,
-    )
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+                if target == "spectrum":
+                    ax.set_xlabel("kx mode", fontsize=label_fontsize)
+                    ax.set_ylabel("ky mode", fontsize=label_fontsize)
+                else:
+                    ax.set_xlabel("x-coordinate", fontsize=label_fontsize)
+                    ax.set_ylabel("y-coordinate", fontsize=label_fontsize)
+                ax.tick_params(axis="both", labelsize=tick_fontsize)
+            else:
+                ax.set_xticks([]); ax.set_yticks([])
+            if col_idx == 0:
+                ax.text(
+                    -0.22,
+                    0.5,
+                    f"{target} @ C={row['C_Value']:.4g}\n[{error_unit(target)}]",
+                    transform=ax.transAxes,
+                    rotation=90,
+                    ha="center",
+                    va="center",
+                    fontsize=label_fontsize,
+                    fontweight="bold",
+                )
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046)
+            cbar.ax.tick_params(labelsize=cbar_tick_fontsize)
+    fig.tight_layout()
     fig.savefig(output_name, dpi=200)
-    print(f"[Success] Saved '{output_name}'.")
+    print(f"[Success] Saved '{output_name}'.", flush=True)
 
 
 # Purpose:
 #   Train and evaluate one Step 3 target family.
 # How it works:
 #   Builds the dataset, runs LOOCV, prints errors, and saves validation figures.
-def train_one_family(target_type, device):
+def train_one_family(target_type, device, save_individual_plots=True):
     dataset = Step4MapDataset(DATA_DIR, target_type=target_type)
     if target_type == "spectrum":
         print(
@@ -446,18 +487,22 @@ def train_one_family(target_type, device):
         unit = error_unit(target_type)
         print(f"C={row['C_Value']:<10.4g} | NN={row['NN_DEX']:<8.4f} {unit} | baseline={row['Base_DEX']:<8.4f} {unit} | POD-recon={row['Floor_DEX']:<8.4f} {unit}")
     sample_row = select_hydrodynamic_row(df)
-    plot_error_comparison(df, target_type, f"step3_{target_type}_error_comparison.png")
-    plot_validation_panel(dataset, sample_row, f"step3_{target_type}_2d_map_validation.png")
-    if target_type == "spectrum":
-        plot_spectrum_mode_sweep(dataset, df, "step3_spectrum_mode_space_sweep.png")
+    if save_individual_plots:
+        plot_error_comparison(df, target_type, f"step3_{target_type}_error_comparison.png")
+        plot_validation_panel(dataset, sample_row, f"step3_{target_type}_2d_map_validation.png")
+        if target_type == "spectrum":
+            plot_spectrum_mode_sweep(dataset, df, "step3_spectrum_mode_space_sweep.png")
     return dataset, df
 
 
 if __name__ == "__main__":
     seed_everything(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[main] Using device: {device}", flush=True)
     target_list = ["rms", "flux", "spectrum"] if TARGET_TYPE == "all" else [TARGET_TYPE]
     all_results = {}
-    for target in target_list:
-        all_results[target] = train_one_family(target, device)
+    for target_idx, target in enumerate(target_list, start=1):
+        print(f"[main] Starting target {target_idx}/{len(target_list)}: {target}", flush=True)
+        all_results[target] = train_one_family(target, device, save_individual_plots=False)
+        print(f"[main] Finished target {target_idx}/{len(target_list)}: {target}", flush=True)
     plot_hydrodynamic_holdout_grid(all_results)
